@@ -1,0 +1,1153 @@
+/* Meus Empréstimos — controle de empréstimos pessoais
+ * HTML/CSS/JS puro, dados salvos no localStorage do navegador.
+ */
+(function () {
+  'use strict';
+
+  const STORAGE_KEY = 'emprestimos.dados.v1';
+  const PASS_KEY = 'emprestimos.senha.v1';
+  const SESSION_KEY = 'emprestimos.sessao';
+
+  const STATUS_LABEL = {
+    'em-dia': 'Em dia',
+    'atrasado': 'Atrasado',
+    'quitado': 'Quitado',
+    'calote': 'Calote'
+  };
+  const PARCELA_LABEL = {
+    'paga': 'Paga',
+    'parcial': 'Parcial',
+    'vencida': 'Vencida',
+    'a-vencer': 'A vencer'
+  };
+
+  // ---------------------------------------------------------------------------
+  // Utilidades
+  // ---------------------------------------------------------------------------
+
+  const $ = (sel, root = document) => root.querySelector(sel);
+  const $$ = (sel, root = document) => Array.from(root.querySelectorAll(sel));
+
+  const brl = new Intl.NumberFormat('pt-BR', { style: 'currency', currency: 'BRL' });
+  const fmtMoney = (v) => brl.format(round2(v || 0));
+  const round2 = (v) => Math.round((Number(v) + Number.EPSILON) * 100) / 100;
+  const EPS = 0.005;
+
+  function esc(s) {
+    return String(s == null ? '' : s)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#39;');
+  }
+
+  function uid() {
+    return Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+  }
+
+  /** Aceita "1.234,56", "1234,56", "1234.56", "R$ 1.234,56". */
+  function parseMoney(str) {
+    if (typeof str === 'number') return str;
+    let s = String(str || '').replace(/[R$\s]/g, '').trim();
+    if (!s) return NaN;
+    if (s.includes(',')) s = s.replace(/\./g, '').replace(',', '.');
+    const n = Number(s);
+    return isFinite(n) ? round2(n) : NaN;
+  }
+
+  function moneyInput(v) {
+    return v == null || v === '' ? '' : round2(v).toFixed(2).replace('.', ',');
+  }
+
+  function todayISO() {
+    const d = new Date();
+    return toISO(d);
+  }
+
+  function toISO(d) {
+    const y = d.getFullYear();
+    const m = String(d.getMonth() + 1).padStart(2, '0');
+    const day = String(d.getDate()).padStart(2, '0');
+    return `${y}-${m}-${day}`;
+  }
+
+  function fromISO(s) {
+    const [y, m, d] = s.split('-').map(Number);
+    return new Date(y, m - 1, d);
+  }
+
+  function fmtDate(s) {
+    if (!s) return '—';
+    const [y, m, d] = s.split('-');
+    return `${d}/${m}/${y}`;
+  }
+
+  /** Soma meses mantendo o dia (ajusta para o último dia do mês quando necessário). */
+  function addMonths(iso, n) {
+    const d = fromISO(iso);
+    const day = d.getDate();
+    const target = new Date(d.getFullYear(), d.getMonth() + n, 1);
+    const lastDay = new Date(target.getFullYear(), target.getMonth() + 1, 0).getDate();
+    target.setDate(Math.min(day, lastDay));
+    return toISO(target);
+  }
+
+  function isValidISO(s) {
+    return typeof s === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(s);
+  }
+
+  let toastTimer;
+  function toast(msg) {
+    const el = $('#toast');
+    el.textContent = msg;
+    el.hidden = false;
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => (el.hidden = true), 2500);
+  }
+
+  function download(filename, content, mime) {
+    const blob = new Blob([content], { type: mime });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Armazenamento
+  // ---------------------------------------------------------------------------
+
+  let db = { versao: 1, emprestimos: [] };
+
+  function load() {
+    try {
+      const raw = localStorage.getItem(STORAGE_KEY);
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        if (parsed && Array.isArray(parsed.emprestimos)) db = parsed;
+      }
+    } catch (e) {
+      console.error(e);
+      alert('Não foi possível ler os dados salvos.');
+    }
+  }
+
+  function save() {
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(db));
+    } catch (e) {
+      console.error(e);
+      alert('Erro ao salvar os dados. O armazenamento do navegador pode estar cheio.');
+    }
+  }
+
+  const getLoan = (id) => db.emprestimos.find((l) => l.id === id);
+
+  // ---------------------------------------------------------------------------
+  // Cálculos
+  // ---------------------------------------------------------------------------
+
+  /** Calcula tudo que é derivado de um empréstimo (status, pago, atraso, parcelas). */
+  function calc(loan) {
+    const hoje = todayISO();
+    const pago = round2(loan.pagamentos.reduce((s, p) => s + p.valor, 0));
+    const restante = round2(Math.max(0, loan.valorTotal - pago));
+
+    // Distribui o total pago pelas parcelas em ordem de vencimento.
+    let disponivel = pago;
+    const parcelas = loan.parcelas
+      .slice()
+      .sort((a, b) => a.vencimento.localeCompare(b.vencimento))
+      .map((p, i) => {
+        const aplicado = round2(Math.min(p.valor, Math.max(0, disponivel)));
+        disponivel = round2(disponivel - aplicado);
+        const falta = round2(p.valor - aplicado);
+        let st;
+        if (falta <= EPS) st = 'paga';
+        else if (p.vencimento < hoje) st = 'vencida';
+        else if (aplicado > EPS) st = 'parcial';
+        else st = 'a-vencer';
+        return { ...p, numero: i + 1, pagoParcela: aplicado, falta, status: st };
+      });
+
+    const emAtraso = round2(
+      parcelas.filter((p) => p.status === 'vencida').reduce((s, p) => s + p.falta, 0)
+    );
+
+    let status;
+    if (loan.calote) status = 'calote';
+    else if (pago + EPS >= loan.valorTotal) status = 'quitado';
+    else if (emAtraso > EPS) status = 'atrasado';
+    else status = 'em-dia';
+
+    const proxima = parcelas.find((p) => p.status !== 'paga') || null;
+    const recuperado = pago + EPS >= loan.valorEmprestado;
+
+    return { pago, restante, parcelas, emAtraso, status, proxima, recuperado };
+  }
+
+  function totals() {
+    const t = {
+      emprestado: 0,
+      aReceber: 0,
+      recebido: 0,
+      pendente: 0,
+      atraso: 0,
+      perdido: 0,
+      lucroReal: 0,
+      lucroPrevisto: 0,
+      lucroLiquido: 0,
+      qtd: { 'em-dia': 0, atrasado: 0, quitado: 0, calote: 0 },
+      qtdLucroReal: 0
+    };
+
+    for (const loan of db.emprestimos) {
+      const c = calc(loan);
+      t.qtd[c.status]++;
+      t.emprestado += loan.valorEmprestado;
+      t.recebido += c.pago;
+
+      if (c.status === 'calote') {
+        // Perda = capital que não voltou.
+        t.perdido += Math.max(0, loan.valorEmprestado - c.pago);
+      } else {
+        t.aReceber += loan.valorTotal;
+        t.pendente += c.restante;
+        t.atraso += c.emAtraso;
+        t.lucroPrevisto += loan.valorTotal - loan.valorEmprestado;
+      }
+
+      // Lucro real: só conta empréstimos quitados ou cujo capital já voltou.
+      if (c.status === 'quitado' || c.recuperado) {
+        t.lucroReal += c.pago - loan.valorEmprestado;
+        t.qtdLucroReal++;
+      }
+    }
+
+    t.lucroLiquido = t.lucroReal - t.perdido;
+    for (const k of Object.keys(t)) if (typeof t[k] === 'number') t[k] = round2(t[k]);
+    return t;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Senha
+  // ---------------------------------------------------------------------------
+
+  async function hashPass(pass) {
+    const data = new TextEncoder().encode('emprestimos::' + pass);
+    if (window.crypto && crypto.subtle) {
+      const buf = await crypto.subtle.digest('SHA-256', data);
+      return 'sha256:' + Array.from(new Uint8Array(buf)).map((b) => b.toString(16).padStart(2, '0')).join('');
+    }
+    // Alternativa simples quando crypto.subtle não está disponível.
+    let h = 5381;
+    for (const b of data) h = ((h << 5) + h + b) >>> 0;
+    return 'djb2:' + h.toString(16);
+  }
+
+  function setupLock() {
+    const hasPass = !!localStorage.getItem(PASS_KEY);
+    const pass2 = $('#lock-pass2');
+    $('#lock-error').hidden = true;
+    $('#lock-pass').value = '';
+    pass2.value = '';
+    if (hasPass) {
+      $('#lock-msg').textContent = 'Digite sua senha para entrar.';
+      pass2.hidden = true;
+      pass2.required = false;
+      $('#lock-btn').textContent = 'Entrar';
+    } else {
+      $('#lock-msg').textContent = 'Primeiro acesso: crie uma senha para proteger o app.';
+      pass2.hidden = false;
+      pass2.required = true;
+      $('#lock-btn').textContent = 'Criar senha e entrar';
+    }
+    $('#app').hidden = true;
+    $('#lock').hidden = false;
+    setTimeout(() => $('#lock-pass').focus(), 50);
+  }
+
+  async function onLockSubmit(e) {
+    e.preventDefault();
+    const err = $('#lock-error');
+    const p1 = $('#lock-pass').value;
+    const stored = localStorage.getItem(PASS_KEY);
+    err.hidden = true;
+
+    if (!stored) {
+      const p2 = $('#lock-pass2').value;
+      if (p1.length < 4) return showErr(err, 'A senha precisa ter pelo menos 4 caracteres.');
+      if (p1 !== p2) return showErr(err, 'As senhas não conferem.');
+      localStorage.setItem(PASS_KEY, await hashPass(p1));
+    } else if ((await hashPass(p1)) !== stored) {
+      $('#lock-pass').value = '';
+      return showErr(err, 'Senha incorreta.');
+    }
+    sessionStorage.setItem(SESSION_KEY, '1');
+    unlock();
+  }
+
+  function showErr(el, msg) {
+    el.textContent = msg;
+    el.hidden = false;
+  }
+
+  function unlock() {
+    $('#lock').hidden = true;
+    $('#app').hidden = false;
+    route();
+  }
+
+  function lock() {
+    sessionStorage.removeItem(SESSION_KEY);
+    setupLock();
+  }
+
+  // ---------------------------------------------------------------------------
+  // Roteamento
+  // ---------------------------------------------------------------------------
+
+  const view = () => $('#view');
+  let listFilter = { pessoa: '', status: '', busca: '' };
+  let formState = null; // estado do formulário de empréstimo em edição
+
+  function setHeader(title, back) {
+    $('#title').textContent = title;
+    $('#btn-back').hidden = !back;
+    document.title = title + ' · Meus Empréstimos';
+  }
+
+  function setNav(name) {
+    $$('.bottomnav a').forEach((a) => a.classList.toggle('active', a.dataset.nav === name));
+  }
+
+  function route() {
+    if ($('#app').hidden) return;
+    const hash = location.hash.replace(/^#/, '') || '/';
+    const parts = hash.split('/').filter(Boolean);
+    window.scrollTo(0, 0);
+
+    if (parts.length === 0) return renderPainel();
+    switch (parts[0]) {
+      case 'lista': return renderLista();
+      case 'novo': return renderForm(null);
+      case 'editar': return renderForm(parts[1]);
+      case 'emprestimo': return renderDetalhe(parts[1]);
+      case 'config': return renderConfig();
+      default: location.hash = '#/';
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Painel
+  // ---------------------------------------------------------------------------
+
+  function renderPainel() {
+    setHeader('Painel', false);
+    setNav('painel');
+    const t = totals();
+    const neg = t.lucroReal < 0;
+
+    const proximos = db.emprestimos
+      .map((l) => ({ l, c: calc(l) }))
+      .filter((x) => x.c.status === 'atrasado' || x.c.status === 'em-dia')
+      .filter((x) => x.c.proxima)
+      .sort((a, b) => a.c.proxima.vencimento.localeCompare(b.c.proxima.vencimento))
+      .slice(0, 5);
+
+    view().innerHTML = `
+      <div class="hero ${neg ? 'negative' : ''}">
+        <div class="hero-label">💰 Lucro real</div>
+        <div class="hero-value">${fmtMoney(t.lucroReal)}</div>
+        <div class="hero-sub">
+          Recebido − emprestado, em ${t.qtdLucroReal} empréstimo(s) quitado(s) ou com capital já recuperado.
+        </div>
+        ${t.perdido > 0 ? `<div class="hero-sub" style="margin-top:6px">Descontando calotes: <strong>${fmtMoney(t.lucroLiquido)}</strong></div>` : ''}
+      </div>
+
+      <div class="stats">
+        <div class="stat teal wide">
+          <div class="stat-label">Lucro previsto</div>
+          <div class="stat-value">${fmtMoney(t.lucroPrevisto)}</div>
+        </div>
+        <div class="stat blue">
+          <div class="stat-label">Total emprestado</div>
+          <div class="stat-value">${fmtMoney(t.emprestado)}</div>
+        </div>
+        <div class="stat blue">
+          <div class="stat-label">Total a receber</div>
+          <div class="stat-value">${fmtMoney(t.aReceber)}</div>
+        </div>
+        <div class="stat green">
+          <div class="stat-label">Já recebido</div>
+          <div class="stat-value">${fmtMoney(t.recebido)}</div>
+        </div>
+        <div class="stat teal">
+          <div class="stat-label">Pendente</div>
+          <div class="stat-value">${fmtMoney(t.pendente)}</div>
+        </div>
+        <div class="stat orange">
+          <div class="stat-label">Em atraso</div>
+          <div class="stat-value">${fmtMoney(t.atraso)}</div>
+        </div>
+        <div class="stat red">
+          <div class="stat-label">Perdido (calotes)</div>
+          <div class="stat-value">${fmtMoney(t.perdido)}</div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>Empréstimos por status</h2>
+        <div class="counts">
+          ${Object.keys(STATUS_LABEL).map((k) => `
+            <a class="badge ${k}" href="#/lista" data-status="${k}">${STATUS_LABEL[k]}: ${t.qtd[k]}</a>
+          `).join('')}
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>Próximos vencimentos</h2>
+        ${proximos.length ? proximos.map(({ l, c }) => `
+          <a class="list-row" href="#/emprestimo/${l.id}" style="color:inherit;text-decoration:none">
+            <div class="grow">
+              <div><strong>${esc(l.nome)}</strong></div>
+              <div class="sub">Parcela ${c.proxima.numero}/${c.parcelas.length} · vence ${fmtDate(c.proxima.vencimento)}</div>
+            </div>
+            <div class="amount">${fmtMoney(c.proxima.falta)}<br><span class="badge ${c.status}">${STATUS_LABEL[c.status]}</span></div>
+          </a>
+        `).join('') : '<p class="muted">Nenhuma parcela em aberto.</p>'}
+      </div>
+
+      ${db.emprestimos.length === 0 ? `
+        <div class="empty">
+          <p>Você ainda não cadastrou nenhum empréstimo.</p>
+          <a class="btn btn-primary" href="#/novo">＋ Cadastrar empréstimo</a>
+        </div>` : ''}
+    `;
+
+    $$('[data-status]', view()).forEach((a) =>
+      a.addEventListener('click', () => {
+        listFilter = { pessoa: '', status: a.dataset.status, busca: '' };
+      })
+    );
+  }
+
+  // ---------------------------------------------------------------------------
+  // Lista
+  // ---------------------------------------------------------------------------
+
+  function renderLista() {
+    setHeader('Empréstimos', false);
+    setNav('lista');
+
+    const pessoas = Array.from(new Set(db.emprestimos.map((l) => l.nome.trim())))
+      .sort((a, b) => a.localeCompare(b, 'pt-BR'));
+    if (listFilter.pessoa && !pessoas.includes(listFilter.pessoa)) listFilter.pessoa = '';
+
+    view().innerHTML = `
+      <div class="filters">
+        <input type="search" id="f-busca" placeholder="🔎 Buscar por nome ou observação" value="${esc(listFilter.busca)}">
+        <select id="f-pessoa">
+          <option value="">Todas as pessoas</option>
+          ${pessoas.map((p) => `<option ${p === listFilter.pessoa ? 'selected' : ''}>${esc(p)}</option>`).join('')}
+        </select>
+        <select id="f-status">
+          <option value="">Todos os status</option>
+          ${Object.keys(STATUS_LABEL).map((k) => `<option value="${k}" ${k === listFilter.status ? 'selected' : ''}>${STATUS_LABEL[k]}</option>`).join('')}
+        </select>
+      </div>
+      <div id="lista-resumo" class="hint" style="margin:0 4px 10px"></div>
+      <div id="lista-itens"></div>
+    `;
+
+    const update = () => {
+      listFilter.busca = $('#f-busca').value;
+      listFilter.pessoa = $('#f-pessoa').value;
+      listFilter.status = $('#f-status').value;
+      renderListaItens();
+    };
+    $('#f-busca').addEventListener('input', update);
+    $('#f-pessoa').addEventListener('change', update);
+    $('#f-status').addEventListener('change', update);
+    renderListaItens();
+  }
+
+  function filteredLoans() {
+    const busca = listFilter.busca.trim().toLowerCase();
+    return db.emprestimos
+      .map((l) => ({ l, c: calc(l) }))
+      .filter(({ l, c }) => {
+        if (listFilter.pessoa && l.nome.trim() !== listFilter.pessoa) return false;
+        if (listFilter.status && c.status !== listFilter.status) return false;
+        if (busca && !(l.nome.toLowerCase().includes(busca) || (l.obs || '').toLowerCase().includes(busca))) return false;
+        return true;
+      })
+      .sort((a, b) => b.l.data.localeCompare(a.l.data));
+  }
+
+  function renderListaItens() {
+    const itens = filteredLoans();
+    const box = $('#lista-itens');
+    const totalEmp = itens.reduce((s, x) => s + x.l.valorEmprestado, 0);
+    const totalRest = itens.reduce((s, x) => s + (x.c.status === 'calote' ? 0 : x.c.restante), 0);
+    $('#lista-resumo').textContent = itens.length
+      ? `${itens.length} empréstimo(s) · emprestado ${fmtMoney(totalEmp)} · falta receber ${fmtMoney(totalRest)}`
+      : '';
+
+    if (!itens.length) {
+      box.innerHTML = db.emprestimos.length
+        ? '<div class="empty">Nenhum empréstimo encontrado com esses filtros.</div>'
+        : '<div class="empty"><p>Nenhum empréstimo cadastrado.</p><a class="btn btn-primary" href="#/novo">＋ Cadastrar empréstimo</a></div>';
+      return;
+    }
+
+    box.innerHTML = itens.map(({ l, c }) => {
+      const pct = l.valorTotal > 0 ? Math.min(100, (c.pago / l.valorTotal) * 100) : 0;
+      let info;
+      if (c.status === 'quitado') info = 'Quitado';
+      else if (c.status === 'calote') info = `Perda: ${fmtMoney(Math.max(0, l.valorEmprestado - c.pago))}`;
+      else if (c.proxima) info = `Próx.: ${fmtDate(c.proxima.vencimento)} · ${fmtMoney(c.proxima.falta)}`;
+      else info = '';
+      return `
+        <a class="loan-item" href="#/emprestimo/${l.id}">
+          <div class="loan-top">
+            <span class="loan-name">${esc(l.nome)}</span>
+            <span class="badge ${c.status}">${STATUS_LABEL[c.status]}</span>
+          </div>
+          <div class="loan-meta">
+            ${fmtDate(l.data)} · Emprestou ${fmtMoney(l.valorEmprestado)} · Receber ${fmtMoney(l.valorTotal)}
+          </div>
+          <div class="loan-meta">
+            Recebido ${fmtMoney(c.pago)} de ${fmtMoney(l.valorTotal)}${info ? ' · ' + info : ''}
+            ${c.emAtraso > 0 && c.status === 'atrasado' ? ` · <strong style="color:var(--orange)">Atraso ${fmtMoney(c.emAtraso)}</strong>` : ''}
+          </div>
+          <div class="progress"><div style="width:${pct}%"></div></div>
+        </a>`;
+    }).join('');
+  }
+
+  // ---------------------------------------------------------------------------
+  // Detalhe
+  // ---------------------------------------------------------------------------
+
+  function renderDetalhe(id) {
+    const loan = getLoan(id);
+    if (!loan) {
+      toast('Empréstimo não encontrado.');
+      location.hash = '#/lista';
+      return;
+    }
+    setHeader(loan.nome, true);
+    setNav('lista');
+    const c = calc(loan);
+    const lucroPrev = loan.valorTotal - loan.valorEmprestado;
+    const lucroAtual = c.pago - loan.valorEmprestado;
+    const pagamentos = loan.pagamentos.slice().sort((a, b) => b.data.localeCompare(a.data));
+
+    view().innerHTML = `
+      <div class="card">
+        <div class="loan-top" style="margin-bottom:14px">
+          <h2 style="margin:0">${esc(loan.nome)}</h2>
+          <span class="badge ${c.status}">${STATUS_LABEL[c.status]}</span>
+        </div>
+        <div class="kv">
+          <div><span>Data</span><strong>${fmtDate(loan.data)}</strong></div>
+          <div><span>Emprestado</span><strong>${fmtMoney(loan.valorEmprestado)}</strong></div>
+          <div><span>Total a receber</span><strong>${fmtMoney(loan.valorTotal)}</strong></div>
+          <div><span>Recebido</span><strong style="color:var(--green)">${fmtMoney(c.pago)}</strong></div>
+          <div><span>Falta receber</span><strong>${fmtMoney(c.restante)}</strong></div>
+          <div><span>Em atraso</span><strong style="color:${c.emAtraso > 0 ? 'var(--orange)' : 'inherit'}">${fmtMoney(c.emAtraso)}</strong></div>
+          <div><span>Lucro previsto</span><strong>${fmtMoney(lucroPrev)}</strong></div>
+          <div><span>Lucro até agora</span><strong style="color:${lucroAtual >= 0 ? 'var(--green)' : 'var(--red)'}">${fmtMoney(lucroAtual)}</strong></div>
+          <div><span>Juros</span><strong>${loan.valorEmprestado > 0 ? ((lucroPrev / loan.valorEmprestado) * 100).toFixed(1).replace('.', ',') + '%' : '—'}</strong></div>
+        </div>
+        ${loan.obs ? `<div class="obs">${esc(loan.obs)}</div>` : ''}
+        <div class="row-btns">
+          ${c.status !== 'calote' ? '<button class="btn btn-primary" id="d-pagar">＋ Registrar pagamento</button>' : ''}
+          <a class="btn" href="#/editar/${loan.id}">✏️ Editar</a>
+        </div>
+      </div>
+
+      <h3 class="section-title">Parcelas (${c.parcelas.length})</h3>
+      <div class="card">
+        ${c.parcelas.map((p) => `
+          <div class="list-row">
+            <div class="grow">
+              <div><strong>${p.numero}ª parcela</strong> · ${fmtDate(p.vencimento)}</div>
+              <div class="sub">Pago ${fmtMoney(p.pagoParcela)} de ${fmtMoney(p.valor)}</div>
+            </div>
+            <div class="amount">
+              ${fmtMoney(p.valor)}<br>
+              <span class="badge ${p.status}">${PARCELA_LABEL[p.status]}</span>
+            </div>
+          </div>`).join('')}
+        <p class="hint">Os pagamentos são abatidos das parcelas em ordem de vencimento.</p>
+      </div>
+
+      <h3 class="section-title">Histórico de pagamentos (${pagamentos.length})</h3>
+      <div class="card">
+        ${pagamentos.length ? pagamentos.map((p) => `
+          <div class="list-row">
+            <div class="grow">
+              <div><strong>${fmtDate(p.data)}</strong></div>
+              ${p.obs ? `<div class="sub">${esc(p.obs)}</div>` : ''}
+            </div>
+            <div class="amount" style="color:var(--green)">${fmtMoney(p.valor)}</div>
+            <div class="actions">
+              <button class="btn btn-sm" data-edit-pay="${p.id}" aria-label="Editar pagamento">✏️</button>
+              <button class="btn btn-sm btn-danger" data-del-pay="${p.id}" aria-label="Excluir pagamento">🗑️</button>
+            </div>
+          </div>`).join('') : '<p class="muted">Nenhum pagamento registrado.</p>'}
+      </div>
+
+      <div class="row-btns">
+        ${loan.calote
+          ? '<button class="btn btn-warn" id="d-calote">↩️ Desmarcar calote</button>'
+          : '<button class="btn btn-warn" id="d-calote">⚠️ Marcar como calote</button>'}
+        <button class="btn btn-danger" id="d-excluir">🗑️ Excluir empréstimo</button>
+      </div>
+    `;
+
+    const pagar = $('#d-pagar');
+    if (pagar) pagar.addEventListener('click', () => openPayDialog(loan, null));
+
+    $$('[data-edit-pay]').forEach((b) =>
+      b.addEventListener('click', () => {
+        const pay = loan.pagamentos.find((p) => p.id === b.dataset.editPay);
+        if (pay) openPayDialog(loan, pay);
+      })
+    );
+    $$('[data-del-pay]').forEach((b) =>
+      b.addEventListener('click', () => {
+        const pay = loan.pagamentos.find((p) => p.id === b.dataset.delPay);
+        if (!pay) return;
+        if (!confirm(`Excluir o pagamento de ${fmtMoney(pay.valor)} em ${fmtDate(pay.data)}?`)) return;
+        loan.pagamentos = loan.pagamentos.filter((p) => p.id !== pay.id);
+        save();
+        toast('Pagamento excluído.');
+        renderDetalhe(loan.id);
+      })
+    );
+
+    $('#d-calote').addEventListener('click', () => {
+      const msg = loan.calote
+        ? 'Desmarcar calote? O status voltará a ser calculado automaticamente.'
+        : `Marcar o empréstimo de ${loan.nome} como calote? O valor não recuperado entra como perda.`;
+      if (!confirm(msg)) return;
+      loan.calote = !loan.calote;
+      save();
+      toast(loan.calote ? 'Marcado como calote.' : 'Calote desmarcado.');
+      renderDetalhe(loan.id);
+    });
+
+    $('#d-excluir').addEventListener('click', () => {
+      if (!confirm(`Excluir o empréstimo de ${loan.nome} e todos os seus pagamentos? Esta ação não pode ser desfeita.`)) return;
+      db.emprestimos = db.emprestimos.filter((l) => l.id !== loan.id);
+      save();
+      toast('Empréstimo excluído.');
+      location.hash = '#/lista';
+    });
+  }
+
+  // ---------------------------------------------------------------------------
+  // Modal de pagamento
+  // ---------------------------------------------------------------------------
+
+  let payCtx = null;
+
+  function openPayDialog(loan, pay) {
+    payCtx = { loanId: loan.id, payId: pay ? pay.id : null };
+    const c = calc(loan);
+    $('#pay-title').textContent = pay ? 'Editar pagamento' : 'Registrar pagamento';
+    $('#pay-data').value = pay ? pay.data : todayISO();
+    $('#pay-valor').value = pay ? moneyInput(pay.valor) : (c.proxima ? moneyInput(c.proxima.falta) : '');
+    $('#pay-obs').value = pay ? pay.obs || '' : (c.proxima ? `Parcela ${c.proxima.numero}/${c.parcelas.length}` : '');
+    $('#pay-error').hidden = true;
+    const dlg = $('#pay-dialog');
+    if (typeof dlg.showModal === 'function') dlg.showModal();
+    else dlg.setAttribute('open', '');
+    setTimeout(() => $('#pay-valor').select(), 50);
+  }
+
+  function closePayDialog() {
+    const dlg = $('#pay-dialog');
+    if (typeof dlg.close === 'function') dlg.close();
+    else dlg.removeAttribute('open');
+    payCtx = null;
+  }
+
+  function onPaySubmit(e) {
+    e.preventDefault();
+    if (!payCtx) return closePayDialog();
+    const loan = getLoan(payCtx.loanId);
+    if (!loan) return closePayDialog();
+    const data = $('#pay-data').value;
+    const valor = parseMoney($('#pay-valor').value);
+    const obs = $('#pay-obs').value.trim();
+    const err = $('#pay-error');
+
+    if (!isValidISO(data)) return showErr(err, 'Informe a data do pagamento.');
+    if (!(valor > 0)) return showErr(err, 'Informe um valor maior que zero.');
+
+    // Avisa se o pagamento ultrapassa o total a receber.
+    const outros = loan.pagamentos.filter((p) => p.id !== payCtx.payId).reduce((s, p) => s + p.valor, 0);
+    if (outros + valor > loan.valorTotal + EPS) {
+      if (!confirm(`Com este pagamento o total recebido (${fmtMoney(outros + valor)}) passa do total a receber (${fmtMoney(loan.valorTotal)}). Salvar mesmo assim?`)) return;
+    }
+
+    if (payCtx.payId) {
+      const pay = loan.pagamentos.find((p) => p.id === payCtx.payId);
+      Object.assign(pay, { data, valor, obs });
+      toast('Pagamento atualizado.');
+    } else {
+      loan.pagamentos.push({ id: uid(), data, valor, obs });
+      toast('Pagamento registrado.');
+    }
+    save();
+    closePayDialog();
+    renderDetalhe(loan.id);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Formulário de empréstimo
+  // ---------------------------------------------------------------------------
+
+  function renderForm(id) {
+    const loan = id ? getLoan(id) : null;
+    if (id && !loan) {
+      toast('Empréstimo não encontrado.');
+      location.hash = '#/lista';
+      return;
+    }
+    setHeader(loan ? 'Editar empréstimo' : 'Novo empréstimo', !!loan);
+    setNav(loan ? 'lista' : 'novo');
+
+    const hoje = todayISO();
+    formState = {
+      id: loan ? loan.id : null,
+      parcelas: loan
+        ? loan.parcelas.slice().sort((a, b) => a.vencimento.localeCompare(b.vencimento)).map((p) => ({ ...p }))
+        : []
+    };
+    const primeiroVenc = formState.parcelas.length ? formState.parcelas[0].vencimento : addMonths(hoje, 1);
+    const pessoas = Array.from(new Set(db.emprestimos.map((l) => l.nome.trim())));
+
+    view().innerHTML = `
+      <form id="loan-form" class="card" autocomplete="off" novalidate>
+        <label>Nome de quem pegou
+          <input type="text" id="l-nome" list="l-pessoas" required value="${esc(loan ? loan.nome : '')}" placeholder="Ex.: João Silva">
+          <datalist id="l-pessoas">${pessoas.map((p) => `<option value="${esc(p)}">`).join('')}</datalist>
+        </label>
+        <label>Data do empréstimo
+          <input type="date" id="l-data" required value="${loan ? loan.data : hoje}">
+        </label>
+        <div class="grid-2">
+          <label>Valor emprestado (R$)
+            <input type="text" inputmode="decimal" id="l-valor" required value="${loan ? moneyInput(loan.valorEmprestado) : ''}" placeholder="0,00">
+          </label>
+          <label>Total a receber (R$)
+            <input type="text" inputmode="decimal" id="l-total" required value="${loan ? moneyInput(loan.valorTotal) : ''}" placeholder="0,00">
+          </label>
+        </div>
+        <p class="hint" id="l-juros" style="margin:-6px 0 12px"></p>
+        <div class="grid-2">
+          <label>Nº de parcelas
+            <input type="number" id="l-nparc" min="1" max="120" step="1" inputmode="numeric" required value="${formState.parcelas.length || 1}">
+          </label>
+          <label>1º vencimento
+            <input type="date" id="l-venc" required value="${primeiroVenc}">
+          </label>
+        </div>
+
+        <div style="display:flex;justify-content:space-between;align-items:center;margin:4px 0 10px">
+          <strong>Parcelas</strong>
+          <button type="button" class="btn btn-sm" id="l-gerar">🔄 Recalcular parcelas</button>
+        </div>
+        <div id="l-parcelas"></div>
+        <p class="parc-sum" id="l-soma"></p>
+        <p class="hint">As datas são mensais a partir do 1º vencimento, mas você pode ajustar cada data e valor.</p>
+
+        <label style="margin-top:14px">Observações
+          <textarea id="l-obs" placeholder="Anotações livres (combinado, telefone, garantia...)">${esc(loan ? loan.obs || '' : '')}</textarea>
+        </label>
+
+        <p id="l-error" class="error" hidden></p>
+        <div class="row-btns">
+          <button type="button" class="btn" id="l-cancelar">Cancelar</button>
+          <button type="submit" class="btn btn-primary">💾 Salvar</button>
+        </div>
+      </form>
+    `;
+
+    if (!formState.parcelas.length) gerarParcelas();
+    else renderParcelasForm();
+    updateJuros();
+
+    $('#l-valor').addEventListener('input', updateJuros);
+    $('#l-total').addEventListener('input', () => { updateJuros(); gerarParcelas(true); });
+    $('#l-nparc').addEventListener('change', () => gerarParcelas());
+    $('#l-venc').addEventListener('change', () => gerarParcelas());
+    $('#l-gerar').addEventListener('click', () => gerarParcelas());
+    $('#l-cancelar').addEventListener('click', () => {
+      location.hash = loan ? `#/emprestimo/${loan.id}` : '#/';
+    });
+    $('#loan-form').addEventListener('submit', onLoanSubmit);
+  }
+
+  function updateJuros() {
+    const v = parseMoney($('#l-valor').value);
+    const t = parseMoney($('#l-total').value);
+    const el = $('#l-juros');
+    if (v > 0 && t > 0) {
+      const lucro = t - v;
+      const pct = ((lucro / v) * 100).toFixed(1).replace('.', ',');
+      el.textContent = `Lucro previsto: ${fmtMoney(lucro)} (${pct}% sobre o valor emprestado)`;
+    } else {
+      el.textContent = '';
+    }
+  }
+
+  /** Gera parcelas mensais de valor igual. Com somenteValores=true mantém as datas atuais. */
+  function gerarParcelas(somenteValores) {
+    const n = Math.max(1, Math.min(120, parseInt($('#l-nparc').value, 10) || 1));
+    $('#l-nparc').value = n;
+    const total = parseMoney($('#l-total').value);
+    const venc = $('#l-venc').value || addMonths(todayISO(), 1);
+    const base = total > 0 ? Math.floor((total / n) * 100) / 100 : 0;
+
+    const novas = [];
+    for (let i = 0; i < n; i++) {
+      const antiga = formState.parcelas[i];
+      const valor = total > 0 ? (i === n - 1 ? round2(total - base * (n - 1)) : base) : 0;
+      novas.push({
+        id: antiga ? antiga.id : uid(),
+        vencimento: somenteValores && antiga ? antiga.vencimento : addMonths(venc, i),
+        valor
+      });
+    }
+    formState.parcelas = novas;
+    renderParcelasForm();
+  }
+
+  function renderParcelasForm() {
+    const box = $('#l-parcelas');
+    box.innerHTML = formState.parcelas.map((p, i) => `
+      <div class="parc-row">
+        <span class="parc-num">${i + 1}ª</span>
+        <input type="date" data-pi="${i}" data-pf="vencimento" value="${p.vencimento}" aria-label="Vencimento da parcela ${i + 1}">
+        <input type="text" inputmode="decimal" data-pi="${i}" data-pf="valor" value="${moneyInput(p.valor)}" aria-label="Valor da parcela ${i + 1}">
+      </div>`).join('');
+
+    $$('[data-pi]', box).forEach((inp) =>
+      inp.addEventListener('input', () => {
+        const p = formState.parcelas[Number(inp.dataset.pi)];
+        if (inp.dataset.pf === 'valor') p.valor = parseMoney(inp.value) || 0;
+        else p.vencimento = inp.value;
+        updateSoma();
+      })
+    );
+    updateSoma();
+  }
+
+  function updateSoma() {
+    const soma = round2(formState.parcelas.reduce((s, p) => s + (p.valor || 0), 0));
+    const total = parseMoney($('#l-total').value);
+    const el = $('#l-soma');
+    const ok = total > 0 && Math.abs(soma - total) <= EPS;
+    el.className = 'parc-sum' + (ok || !(total > 0) ? '' : ' bad');
+    el.textContent = `Soma das parcelas: ${fmtMoney(soma)}` +
+      (total > 0 && !ok ? ` — diferente do total a receber (${fmtMoney(total)})` : '');
+  }
+
+  function onLoanSubmit(e) {
+    e.preventDefault();
+    const err = $('#l-error');
+    err.hidden = true;
+
+    const nome = $('#l-nome').value.trim();
+    const data = $('#l-data').value;
+    const valorEmprestado = parseMoney($('#l-valor').value);
+    const valorTotal = parseMoney($('#l-total').value);
+    const obs = $('#l-obs').value.trim();
+    const parcelas = formState.parcelas.map((p) => ({ id: p.id, vencimento: p.vencimento, valor: round2(p.valor) }));
+
+    if (!nome) return showErr(err, 'Informe o nome de quem pegou o empréstimo.');
+    if (!isValidISO(data)) return showErr(err, 'Informe a data do empréstimo.');
+    if (!(valorEmprestado > 0)) return showErr(err, 'Informe o valor emprestado.');
+    if (!(valorTotal > 0)) return showErr(err, 'Informe o valor total a receber.');
+    if (!parcelas.length) return showErr(err, 'Informe ao menos uma parcela.');
+    if (parcelas.some((p) => !isValidISO(p.vencimento))) return showErr(err, 'Preencha a data de vencimento de todas as parcelas.');
+    if (parcelas.some((p) => !(p.valor > 0))) return showErr(err, 'Todas as parcelas precisam ter valor maior que zero.');
+    const soma = round2(parcelas.reduce((s, p) => s + p.valor, 0));
+    if (Math.abs(soma - valorTotal) > EPS) {
+      return showErr(err, `A soma das parcelas (${fmtMoney(soma)}) precisa ser igual ao total a receber (${fmtMoney(valorTotal)}). Use "Recalcular parcelas" ou ajuste os valores.`);
+    }
+    if (valorTotal < valorEmprestado &&
+        !confirm('O total a receber é menor que o valor emprestado (prejuízo). Salvar mesmo assim?')) return;
+
+    parcelas.sort((a, b) => a.vencimento.localeCompare(b.vencimento));
+
+    let loan;
+    if (formState.id) {
+      loan = getLoan(formState.id);
+      Object.assign(loan, { nome, data, valorEmprestado, valorTotal, parcelas, obs, atualizadoEm: new Date().toISOString() });
+      toast('Empréstimo atualizado.');
+    } else {
+      loan = {
+        id: uid(), nome, data, valorEmprestado, valorTotal, parcelas, obs,
+        calote: false, pagamentos: [], criadoEm: new Date().toISOString()
+      };
+      db.emprestimos.push(loan);
+      toast('Empréstimo cadastrado.');
+    }
+    save();
+    formState = null;
+    location.hash = `#/emprestimo/${loan.id}`;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Dados (backup, CSV, senha)
+  // ---------------------------------------------------------------------------
+
+  function renderConfig() {
+    setHeader('Dados e segurança', false);
+    setNav('config');
+    const nPag = db.emprestimos.reduce((s, l) => s + l.pagamentos.length, 0);
+
+    view().innerHTML = `
+      <div class="card">
+        <h2>Backup</h2>
+        <p class="muted" style="margin-top:0">
+          Seus dados ficam salvos apenas neste navegador (${db.emprestimos.length} empréstimo(s), ${nPag} pagamento(s)).
+          Faça backups com frequência para não perder nada.
+        </p>
+        <div class="row-btns">
+          <button class="btn btn-primary" id="c-export">⬇️ Exportar backup (JSON)</button>
+          <button class="btn" id="c-import">⬆️ Importar backup</button>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>Planilha</h2>
+        <p class="muted" style="margin-top:0">Exporta a lista de empréstimos em CSV (abre no Excel / Google Planilhas).</p>
+        <div class="row-btns">
+          <button class="btn" id="c-csv">📄 Exportar empréstimos (CSV)</button>
+          <button class="btn" id="c-csv-pag">📄 Exportar pagamentos (CSV)</button>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>Senha</h2>
+        <form id="c-senha-form" autocomplete="off">
+          <label>Senha atual <input type="password" id="c-atual" required></label>
+          <label>Nova senha <input type="password" id="c-nova" required></label>
+          <label>Confirme a nova senha <input type="password" id="c-nova2" required></label>
+          <p id="c-senha-err" class="error" hidden></p>
+          <button class="btn btn-primary btn-block" type="submit">Alterar senha</button>
+        </form>
+        <p class="hint">A senha impede que outras pessoas abram o app neste aparelho, mas não criptografa os dados.</p>
+      </div>
+
+      <div class="card">
+        <h2>Zona de perigo</h2>
+        <button class="btn btn-danger btn-block" id="c-apagar">🗑️ Apagar todos os dados</button>
+      </div>
+    `;
+
+    $('#c-export').addEventListener('click', exportJSON);
+    $('#c-import').addEventListener('click', () => $('#import-file').click());
+    $('#c-csv').addEventListener('click', exportCSV);
+    $('#c-csv-pag').addEventListener('click', exportPagamentosCSV);
+    $('#c-senha-form').addEventListener('submit', onChangePass);
+    $('#c-apagar').addEventListener('click', () => {
+      if (!confirm('Apagar TODOS os empréstimos e pagamentos deste aparelho?')) return;
+      if (!confirm('Tem certeza? Recomendamos exportar um backup antes. Esta ação não pode ser desfeita.')) return;
+      db = { versao: 1, emprestimos: [] };
+      save();
+      toast('Dados apagados.');
+      renderConfig();
+    });
+  }
+
+  async function onChangePass(e) {
+    e.preventDefault();
+    const err = $('#c-senha-err');
+    err.hidden = true;
+    const atual = $('#c-atual').value;
+    const nova = $('#c-nova').value;
+    const nova2 = $('#c-nova2').value;
+    if ((await hashPass(atual)) !== localStorage.getItem(PASS_KEY)) return showErr(err, 'Senha atual incorreta.');
+    if (nova.length < 4) return showErr(err, 'A nova senha precisa ter pelo menos 4 caracteres.');
+    if (nova !== nova2) return showErr(err, 'As novas senhas não conferem.');
+    localStorage.setItem(PASS_KEY, await hashPass(nova));
+    e.target.reset();
+    toast('Senha alterada.');
+  }
+
+  function stamp() {
+    const d = new Date();
+    return toISO(d) + '_' + String(d.getHours()).padStart(2, '0') + String(d.getMinutes()).padStart(2, '0');
+  }
+
+  function exportJSON() {
+    const payload = {
+      app: 'meus-emprestimos',
+      versao: 1,
+      exportadoEm: new Date().toISOString(),
+      emprestimos: db.emprestimos
+    };
+    download(`emprestimos-backup_${stamp()}.json`, JSON.stringify(payload, null, 2), 'application/json');
+    toast('Backup exportado.');
+  }
+
+  /** Valida e normaliza um empréstimo vindo de um backup. Retorna null se inválido. */
+  function normalizeLoan(l) {
+    if (!l || typeof l !== 'object') return null;
+    const num = (v) => (typeof v === 'number' ? round2(v) : parseMoney(v));
+    const loan = {
+      id: String(l.id || uid()),
+      nome: String(l.nome || '').trim(),
+      data: String(l.data || ''),
+      valorEmprestado: num(l.valorEmprestado),
+      valorTotal: num(l.valorTotal),
+      obs: String(l.obs || ''),
+      calote: !!l.calote,
+      criadoEm: l.criadoEm || new Date().toISOString(),
+      parcelas: Array.isArray(l.parcelas) ? l.parcelas.map((p) => ({
+        id: String((p && p.id) || uid()),
+        vencimento: String((p && p.vencimento) || ''),
+        valor: num(p && p.valor)
+      })) : [],
+      pagamentos: Array.isArray(l.pagamentos) ? l.pagamentos.map((p) => ({
+        id: String((p && p.id) || uid()),
+        data: String((p && p.data) || ''),
+        valor: num(p && p.valor),
+        obs: String((p && p.obs) || '')
+      })) : []
+    };
+    if (l.atualizadoEm) loan.atualizadoEm = l.atualizadoEm;
+    if (!loan.nome || !isValidISO(loan.data) || !(loan.valorEmprestado >= 0) || !(loan.valorTotal >= 0)) return null;
+    if (loan.parcelas.some((p) => !isValidISO(p.vencimento) || !(p.valor >= 0))) return null;
+    if (loan.pagamentos.some((p) => !isValidISO(p.data) || !(p.valor >= 0))) return null;
+    if (!loan.parcelas.length) loan.parcelas = [{ id: uid(), vencimento: loan.data, valor: loan.valorTotal }];
+    return loan;
+  }
+
+  function onImportFile(e) {
+    const file = e.target.files[0];
+    e.target.value = '';
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      let parsed;
+      try {
+        parsed = JSON.parse(reader.result);
+      } catch (_) {
+        return alert('Arquivo inválido: não é um JSON.');
+      }
+      const lista = Array.isArray(parsed) ? parsed : parsed && parsed.emprestimos;
+      if (!Array.isArray(lista)) return alert('Arquivo inválido: não contém empréstimos.');
+
+      const validos = lista.map(normalizeLoan).filter(Boolean);
+      const invalidos = lista.length - validos.length;
+      if (!validos.length) return alert('Nenhum empréstimo válido encontrado no arquivo.');
+
+      const msg = `O backup contém ${validos.length} empréstimo(s)` +
+        (invalidos ? ` (${invalidos} inválido(s) serão ignorados)` : '') +
+        `.\n\nOK = SUBSTITUIR todos os dados atuais pelo backup.\nCancelar = escolher outra opção.`;
+      if (confirm(msg)) {
+        db = { versao: 1, emprestimos: validos };
+      } else if (confirm('Deseja JUNTAR o backup com os dados atuais?\n(Empréstimos com o mesmo ID serão atualizados pelo backup.)')) {
+        const byId = new Map(db.emprestimos.map((l) => [l.id, l]));
+        validos.forEach((l) => byId.set(l.id, l));
+        db = { versao: 1, emprestimos: Array.from(byId.values()) };
+      } else {
+        return;
+      }
+      save();
+      toast('Backup importado.');
+      route();
+    };
+    reader.onerror = () => alert('Não foi possível ler o arquivo.');
+    reader.readAsText(file);
+  }
+
+  function csvCell(v) {
+    const s = String(v == null ? '' : v);
+    return /[";\n\r]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+  }
+
+  const csvNum = (v) => round2(v).toFixed(2).replace('.', ',');
+
+  function toCSV(rows) {
+    // BOM + ponto e vírgula: abre corretamente no Excel em português.
+    return '﻿' + rows.map((r) => r.map(csvCell).join(';')).join('\r\n');
+  }
+
+  function exportCSV() {
+    if (!db.emprestimos.length) return toast('Não há empréstimos para exportar.');
+    const rows = [[
+      'Nome', 'Data', 'Valor emprestado', 'Total a receber', 'Lucro previsto', 'Recebido',
+      'Falta receber', 'Em atraso', 'Status', 'Parcelas', 'Parcelas pagas', 'Próximo vencimento', 'Observações'
+    ]];
+    db.emprestimos
+      .slice()
+      .sort((a, b) => a.data.localeCompare(b.data))
+      .forEach((l) => {
+        const c = calc(l);
+        rows.push([
+          l.nome, fmtDate(l.data), csvNum(l.valorEmprestado), csvNum(l.valorTotal),
+          csvNum(l.valorTotal - l.valorEmprestado), csvNum(c.pago), csvNum(c.restante),
+          csvNum(c.emAtraso), STATUS_LABEL[c.status], c.parcelas.length,
+          c.parcelas.filter((p) => p.status === 'paga').length,
+          c.proxima && c.status !== 'calote' ? fmtDate(c.proxima.vencimento) : '',
+          l.obs || ''
+        ]);
+      });
+    download(`emprestimos_${stamp()}.csv`, toCSV(rows), 'text/csv;charset=utf-8');
+    toast('CSV exportado.');
+  }
+
+  function exportPagamentosCSV() {
+    const rows = [['Nome', 'Data do empréstimo', 'Data do pagamento', 'Valor', 'Observação']];
+    db.emprestimos.forEach((l) =>
+      l.pagamentos
+        .slice()
+        .sort((a, b) => a.data.localeCompare(b.data))
+        .forEach((p) => rows.push([l.nome, fmtDate(l.data), fmtDate(p.data), csvNum(p.valor), p.obs || '']))
+    );
+    if (rows.length === 1) return toast('Não há pagamentos para exportar.');
+    download(`pagamentos_${stamp()}.csv`, toCSV(rows), 'text/csv;charset=utf-8');
+    toast('CSV exportado.');
+  }
+
+  // ---------------------------------------------------------------------------
+  // Inicialização
+  // ---------------------------------------------------------------------------
+
+  function init() {
+    load();
+    $('#lock-form').addEventListener('submit', onLockSubmit);
+    $('#btn-lock').addEventListener('click', lock);
+    $('#btn-back').addEventListener('click', () => history.length > 1 ? history.back() : (location.hash = '#/lista'));
+    $('#pay-form').addEventListener('submit', onPaySubmit);
+    $('#pay-cancel').addEventListener('click', closePayDialog);
+    $('#import-file').addEventListener('change', onImportFile);
+    window.addEventListener('hashchange', route);
+
+    // Mantém os dados sincronizados se o app estiver aberto em outra aba.
+    window.addEventListener('storage', (e) => {
+      if (e.key === STORAGE_KEY) { load(); route(); }
+    });
+
+    if (localStorage.getItem(PASS_KEY) && sessionStorage.getItem(SESSION_KEY) === '1') unlock();
+    else setupLock();
+  }
+
+  document.addEventListener('DOMContentLoaded', init);
+})();
