@@ -14,8 +14,9 @@ Os dados ficam salvos no `localStorage` **deste navegador**. Use **Dados → Exp
 - Pagamentos parciais ou de parcelas, com data, valor e observação (editar/excluir).
 - Status automático: **Em dia**, **Atrasado**, **Quitado**; **Calote** marcado manualmente.
 - Painel: total emprestado, a receber, recebido, pendente, em atraso, perdido (calotes), lucro previsto e **lucro real** em destaque.
+- **Lucro mensal**: gráfico e tabela do lucro mês a mês por ano, com detalhe de cada mês (pagamentos recebidos, lucro de cada um, calotes) e card do mês atual no painel.
 - Lista com filtro por pessoa, status e busca; tela de detalhe com parcelas e histórico de pagamentos.
-- Exportação/importação de backup em JSON e exportação em CSV (empréstimos e pagamentos).
+- Exportação/importação de backup em JSON e exportação em CSV (empréstimos, pagamentos e lucro mensal).
 - Senha simples para abrir o app.
 
 ## Regras de cálculo
@@ -24,4 +25,8 @@ Os dados ficam salvos no `localStorage` **deste navegador**. Use **Dados → Exp
 - **Lucro previsto** = total a receber − total emprestado (empréstimos que não são calote).
 - **Total perdido** = valor emprestado − valor já recebido dos empréstimos marcados como calote.
 - **Em atraso** = parte não paga das parcelas com vencimento anterior a hoje. Os pagamentos são abatidos das parcelas em ordem de vencimento.
+- **Lucro mensal**: o lucro entra no mês em que cada pagamento foi recebido. Há dois métodos, escolhidos na tela Mensal:
+  - *Juros por pagamento* (padrão): cada pagamento tem a mesma fração de juros do empréstimo. Ex.: emprestou R$ 1.000 para receber R$ 1.300 → 23% de cada pagamento é lucro.
+  - *Capital primeiro*: os pagamentos devolvem primeiro o valor emprestado e só o que passar dele é lucro. A soma dos meses bate com o lucro real do painel.
+  - Calotes entram como perda no mês em que foram marcados (lucro líquido = lucro − perdas).
 - A senha só impede o acesso pela tela do app; os dados não são criptografados.

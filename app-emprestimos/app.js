@@ -7,6 +7,11 @@
   const STORAGE_KEY = 'emprestimos.dados.v1';
   const PASS_KEY = 'emprestimos.senha.v1';
   const SESSION_KEY = 'emprestimos.sessao';
+  const METODO_KEY = 'emprestimos.metodoLucro';
+
+  const MESES = ['Jan', 'Fev', 'Mar', 'Abr', 'Mai', 'Jun', 'Jul', 'Ago', 'Set', 'Out', 'Nov', 'Dez'];
+  const MESES_LONGO = ['Janeiro', 'Fevereiro', 'Março', 'Abril', 'Maio', 'Junho',
+    'Julho', 'Agosto', 'Setembro', 'Outubro', 'Novembro', 'Dezembro'];
 
   const STATUS_LABEL = {
     'em-dia': 'Em dia',
@@ -30,6 +35,8 @@
 
   const brl = new Intl.NumberFormat('pt-BR', { style: 'currency', currency: 'BRL' });
   const fmtMoney = (v) => brl.format(round2(v || 0));
+  const num2 = new Intl.NumberFormat('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  const fmtNum = (v) => num2.format(round2(v || 0));
   const round2 = (v) => Math.round((Number(v) + Number.EPSILON) * 100) / 100;
   const EPS = 0.005;
 
@@ -339,6 +346,7 @@
       case 'editar': return renderForm(parts[1]);
       case 'emprestimo': return renderDetalhe(parts[1]);
       case 'config': return renderConfig();
+      case 'mensal': return renderMensal(parts[1]);
       default: location.hash = '#/';
     }
   }
@@ -401,6 +409,8 @@
         </div>
       </div>
 
+      ${cardMesAtual()}
+
       <div class="card">
         <h2>Empréstimos por status</h2>
         <div class="counts">
@@ -435,6 +445,301 @@
         listFilter = { pessoa: '', status: a.dataset.status, busca: '' };
       })
     );
+  }
+
+  // ---------------------------------------------------------------------------
+  // Lucro mensal
+  // ---------------------------------------------------------------------------
+
+  function getMetodo() {
+    try { return localStorage.getItem(METODO_KEY) === 'capital' ? 'capital' : 'proporcional'; }
+    catch (_) { return 'proporcional'; }
+  }
+
+  const mesKey = (iso) => iso.slice(0, 7);
+  const mesLabel = (key) => `${MESES_LONGO[Number(key.slice(5, 7)) - 1]} de ${key.slice(0, 4)}`;
+
+  /**
+   * Distribui o lucro de cada pagamento no mês em que ele foi recebido.
+   * - proporcional: cada pagamento carrega a mesma fração de juros do empréstimo
+   *   (ex.: emprestou 1.000 para receber 1.300 → 23% de cada pagamento é lucro).
+   * - capital: os pagamentos devolvem primeiro o valor emprestado; só o que passa
+   *   dele é lucro (o total bate com o "lucro real" do painel).
+   * Calotes entram como perda no mês em que foram marcados.
+   */
+  function lucroPorMes(metodo) {
+    const meses = {};
+    const mes = (key) => meses[key] || (meses[key] = {
+      recebido: 0, lucro: 0, perdas: 0, emprestado: 0, pagamentos: [], calotes: []
+    });
+
+    for (const loan of db.emprestimos) {
+      mes(mesKey(loan.data)).emprestado += loan.valorEmprestado;
+
+      const fracao = loan.valorTotal > 0 ? (loan.valorTotal - loan.valorEmprestado) / loan.valorTotal : 0;
+      let acumulado = 0;
+      let capitalVoltou = 0;
+      const pags = loan.pagamentos.slice().sort((a, b) => a.data.localeCompare(b.data));
+
+      for (const p of pags) {
+        let lucro;
+        if (metodo === 'capital') {
+          lucro = Math.max(0, acumulado + p.valor - loan.valorEmprestado) - Math.max(0, acumulado - loan.valorEmprestado);
+        } else {
+          // Até o total combinado, aplica a fração de juros; o que passar do total é lucro integral.
+          const dentro = Math.max(0, Math.min(p.valor, loan.valorTotal - acumulado));
+          lucro = dentro * fracao + (p.valor - dentro);
+        }
+        acumulado += p.valor;
+        capitalVoltou += p.valor - lucro;
+        const m = mes(mesKey(p.data));
+        m.recebido += p.valor;
+        m.lucro += lucro;
+        m.pagamentos.push({ loan, pag: p, lucro: round2(lucro) });
+      }
+
+      if (loan.calote) {
+        const perda = round2(Math.max(0, loan.valorEmprestado - capitalVoltou));
+        if (perda > 0) {
+          const ultimo = pags.length ? pags[pags.length - 1].data : loan.data;
+          const m = mes(mesKey(loan.caloteEm || ultimo));
+          m.perdas += perda;
+          m.calotes.push({ loan, perda });
+        }
+      }
+    }
+
+    for (const m of Object.values(meses)) {
+      m.recebido = round2(m.recebido);
+      m.lucro = round2(m.lucro);
+      m.perdas = round2(m.perdas);
+      m.emprestado = round2(m.emprestado);
+      m.liquido = round2(m.lucro - m.perdas);
+      m.pagamentos.sort((a, b) => b.pag.data.localeCompare(a.pag.data));
+    }
+    return meses;
+  }
+
+  function cardMesAtual() {
+    if (!db.emprestimos.length) return '';
+    const meses = lucroPorMes(getMetodo());
+    const atual = mesKey(todayISO());
+    const anterior = mesKey(addMonths(atual + '-01', -1));
+    const a = meses[atual] || { liquido: 0, recebido: 0 };
+    const b = meses[anterior] || { liquido: 0 };
+    const diff = round2(a.liquido - b.liquido);
+    return `
+      <a class="card month-card" href="#/mensal">
+        <div>
+          <div class="stat-label">Lucro de ${MESES_LONGO[Number(atual.slice(5)) - 1].toLowerCase()}</div>
+          <div class="stat-value" style="color:${a.liquido < 0 ? 'var(--red)' : 'var(--green)'}">${fmtMoney(a.liquido)}</div>
+          <div class="hint">Recebido no mês: ${fmtMoney(a.recebido)} ·
+            ${diff === 0 ? 'igual ao mês passado' : `${diff > 0 ? '▲' : '▼'} ${fmtMoney(Math.abs(diff))} vs. mês passado`}</div>
+        </div>
+        <span class="month-card-link">Ver mês a mês ›</span>
+      </a>`;
+  }
+
+  let mensalSel = null; // { ano, mes } selecionado na tela mensal
+
+  function renderMensal() {
+    setHeader('Lucro mensal', false);
+    setNav('mensal');
+
+    const metodo = getMetodo();
+    const meses = lucroPorMes(metodo);
+    const hoje = todayISO();
+    const anoAtual = Number(hoje.slice(0, 4));
+    const anos = Array.from(new Set(Object.keys(meses).map((k) => Number(k.slice(0, 4))).concat(anoAtual)))
+      .sort((a, b) => b - a);
+
+    if (!mensalSel || !anos.includes(mensalSel.ano)) mensalSel = { ano: anoAtual, mes: null };
+    const ano = mensalSel.ano;
+    const dados = MESES.map((_, i) => {
+      const key = `${ano}-${String(i + 1).padStart(2, '0')}`;
+      return { key, i, ...(meses[key] || { recebido: 0, lucro: 0, perdas: 0, emprestado: 0, liquido: 0, pagamentos: [], calotes: [] }) };
+    });
+    const comDados = dados.filter((d) => d.recebido || d.perdas || d.emprestado);
+
+    if (mensalSel.mes == null) {
+      const mesAtual = Number(hoje.slice(5, 7)) - 1;
+      mensalSel.mes = ano === anoAtual ? mesAtual : (comDados.length ? comDados[comDados.length - 1].i : 11);
+    }
+
+    const tot = dados.reduce((t, d) => {
+      t.recebido += d.recebido; t.lucro += d.lucro; t.perdas += d.perdas; t.liquido += d.liquido; t.emprestado += d.emprestado;
+      return t;
+    }, { recebido: 0, lucro: 0, perdas: 0, liquido: 0, emprestado: 0 });
+    // Média só dos meses já decorridos (no ano atual) ou dos 12 meses (anos passados).
+    const mesesDecorridos = ano === anoAtual ? Number(hoje.slice(5, 7)) : ano < anoAtual ? 12 : 0;
+    const media = mesesDecorridos ? tot.liquido / mesesDecorridos : 0;
+    const melhor = comDados.length ? comDados.reduce((m, d) => (d.liquido > m.liquido ? d : m)) : null;
+    const temPerdas = tot.perdas > 0;
+
+    view().innerHTML = `
+      <div class="filters filters-2">
+        <select id="m-ano" aria-label="Ano">
+          ${anos.map((a) => `<option ${a === ano ? 'selected' : ''}>${a}</option>`).join('')}
+        </select>
+        <select id="m-metodo" aria-label="Como calcular o lucro">
+          <option value="proporcional" ${metodo === 'proporcional' ? 'selected' : ''}>Juros por pagamento</option>
+          <option value="capital" ${metodo === 'capital' ? 'selected' : ''}>Capital primeiro</option>
+        </select>
+      </div>
+      <p class="hint" style="margin:-4px 4px 12px">
+        ${metodo === 'proporcional'
+          ? 'Cada pagamento recebido tem uma parte de juros (lucro) e uma parte de devolução do valor emprestado.'
+          : 'Os pagamentos devolvem primeiro o valor emprestado; só o que passar dele conta como lucro. A soma de todos os meses bate com o lucro real do painel.'}
+      </p>
+
+      <div class="stats">
+        <div class="stat green">
+          <div class="stat-label">Lucro em ${ano}${temPerdas ? ' (líquido)' : ''}</div>
+          <div class="stat-value">${fmtMoney(tot.liquido)}</div>
+        </div>
+        <div class="stat teal">
+          <div class="stat-label">Média por mês</div>
+          <div class="stat-value">${fmtMoney(media)}</div>
+        </div>
+        <div class="stat blue">
+          <div class="stat-label">Recebido em ${ano}</div>
+          <div class="stat-value">${fmtMoney(tot.recebido)}</div>
+        </div>
+        <div class="stat green">
+          <div class="stat-label">Melhor mês</div>
+          <div class="stat-value">${melhor && melhor.liquido > 0 ? `${MESES[melhor.i]} · ${fmtMoney(melhor.liquido)}` : '—'}</div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>Lucro${temPerdas ? ' líquido' : ''} mês a mês</h2>
+        ${chartMensal(dados, mensalSel.mes)}
+        <p class="hint" style="text-align:center">Toque em um mês para ver os detalhes.</p>
+      </div>
+
+      <div id="m-detalhe">${detalheMes(dados[mensalSel.mes], metodo)}</div>
+
+      <h3 class="section-title">Tabela de ${ano} (valores em R$)</h3>
+      <div class="card table-wrap">
+        <table class="table">
+          <thead><tr>
+            <th>Mês</th><th>Recebido</th><th>Lucro</th>${temPerdas ? '<th>Perdas</th><th>Líquido</th>' : ''}
+          </tr></thead>
+          <tbody>
+            ${dados.map((d) => `
+              <tr data-mes="${d.i}" class="${d.i === mensalSel.mes ? 'sel' : ''}">
+                <td>${MESES[d.i]}</td>
+                <td>${fmtNum(d.recebido)}</td>
+                <td class="${d.lucro < 0 ? 'neg' : d.lucro > 0 ? 'pos' : ''}">${fmtNum(d.lucro)}</td>
+                ${temPerdas ? `<td class="${d.perdas > 0 ? 'neg' : ''}">${d.perdas > 0 ? '−' + fmtNum(d.perdas) : fmtNum(0)}</td>
+                <td class="${d.liquido < 0 ? 'neg' : d.liquido > 0 ? 'pos' : ''}"><strong>${fmtNum(d.liquido)}</strong></td>` : ''}
+              </tr>`).join('')}
+          </tbody>
+          <tfoot><tr>
+            <td>Total</td><td>${fmtNum(tot.recebido)}</td><td>${fmtNum(tot.lucro)}</td>
+            ${temPerdas ? `<td>−${fmtNum(tot.perdas)}</td><td>${fmtNum(tot.liquido)}</td>` : ''}
+          </tr></tfoot>
+        </table>
+      </div>
+    `;
+
+    $('#m-ano').addEventListener('change', (e) => {
+      mensalSel = { ano: Number(e.target.value), mes: null };
+      renderMensal();
+    });
+    $('#m-metodo').addEventListener('change', (e) => {
+      try { localStorage.setItem(METODO_KEY, e.target.value); } catch (_) { /* preferência opcional */ }
+      renderMensal();
+    });
+    $$('[data-mes]', view()).forEach((el) =>
+      el.addEventListener('click', () => {
+        mensalSel.mes = Number(el.dataset.mes);
+        renderMensal();
+        $('#m-detalhe').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+      })
+    );
+  }
+
+  /** Gráfico de barras simples (HTML/CSS) com linha do zero; meses negativos ficam abaixo dela. */
+  function chartMensal(dados, sel) {
+    const H = 160;
+    const maxPos = Math.max(0, ...dados.map((d) => d.liquido));
+    const maxNeg = Math.max(0, ...dados.map((d) => -d.liquido));
+    const escala = maxPos + maxNeg || 1;
+    const hPos = maxNeg ? (H * maxPos) / escala : H;
+    const hNeg = H - hPos;
+
+    const colunas = dados.map((d) => {
+      const altura = Math.abs(d.liquido) / escala * H;
+      const visivel = d.liquido !== 0 ? Math.max(altura, 3) : 0;
+      const neg = d.liquido < 0;
+      return `
+        <button type="button" class="bar-col ${d.i === sel ? 'sel' : ''}" data-mes="${d.i}"
+          aria-label="${MESES_LONGO[d.i]}: ${fmtMoney(d.liquido)}">
+          <span class="bar-pos" style="height:${hPos}px">
+            ${!neg && visivel ? `<span class="bar" style="height:${visivel}px"></span>` : ''}
+          </span>
+          <span class="bar-neg" style="height:${hNeg}px">
+            ${neg ? `<span class="bar bar-down" style="height:${visivel}px"></span>` : ''}
+          </span>
+          <span class="bar-label">${MESES[d.i].charAt(0)}<span class="bar-label-rest">${MESES[d.i].slice(1)}</span></span>
+        </button>`;
+    }).join('');
+
+    return `
+      <div class="chart" role="img" aria-label="Gráfico de lucro mensal">
+        <div class="chart-axis">
+          <span>${fmtShort(maxPos)}</span>
+          ${maxNeg ? `<span>−${fmtShort(maxNeg)}</span>` : '<span>0</span>'}
+        </div>
+        <div class="chart-bars" style="--zero:${hPos}px">${colunas}</div>
+      </div>`;
+  }
+
+  /** Valor curto para o eixo: 1,2 mil, 850, etc. */
+  function fmtShort(v) {
+    if (v >= 1000) return (v / 1000).toFixed(v >= 10000 ? 0 : 1).replace('.', ',') + ' mil';
+    return String(Math.round(v));
+  }
+
+  function detalheMes(d, metodo) {
+    const pags = d.pagamentos;
+    return `
+      <div class="card">
+        <h2>${mesLabel(d.key)}</h2>
+        <div class="kv">
+          <div><span>Recebido</span><strong>${fmtMoney(d.recebido)}</strong></div>
+          <div><span>Lucro</span><strong style="color:${d.lucro < 0 ? 'var(--red)' : 'var(--green)'}">${fmtMoney(d.lucro)}</strong></div>
+          <div><span>Devolução de capital</span><strong>${fmtMoney(d.recebido - d.lucro)}</strong></div>
+          ${d.perdas > 0 ? `
+            <div><span>Perdas (calotes)</span><strong style="color:var(--red)">−${fmtMoney(d.perdas)}</strong></div>
+            <div><span>Lucro líquido</span><strong style="color:${d.liquido < 0 ? 'var(--red)' : 'var(--green)'}">${fmtMoney(d.liquido)}</strong></div>` : ''}
+          <div><span>Emprestado no mês</span><strong>${fmtMoney(d.emprestado)}</strong></div>
+        </div>
+
+        <h3 class="section-title" style="margin-left:0">Pagamentos recebidos (${pags.length})</h3>
+        ${pags.length ? pags.map((x) => `
+          <a class="list-row" href="#/emprestimo/${x.loan.id}" style="color:inherit;text-decoration:none">
+            <div class="grow">
+              <div><strong>${esc(x.loan.nome)}</strong></div>
+              <div class="sub">${fmtDate(x.pag.data)}${x.pag.obs ? ' · ' + esc(x.pag.obs) : ''}</div>
+            </div>
+            <div class="amount">${fmtMoney(x.pag.valor)}<br>
+              <span class="sub" style="color:${x.lucro > 0 ? 'var(--green)' : 'var(--muted)'}">lucro ${fmtMoney(x.lucro)}</span>
+            </div>
+          </a>`).join('') : '<p class="muted">Nenhum pagamento recebido neste mês.</p>'}
+
+        ${d.calotes.length ? `
+          <h3 class="section-title" style="margin-left:0">Calotes (${d.calotes.length})</h3>
+          ${d.calotes.map((x) => `
+            <a class="list-row" href="#/emprestimo/${x.loan.id}" style="color:inherit;text-decoration:none">
+              <div class="grow"><strong>${esc(x.loan.nome)}</strong></div>
+              <div class="amount" style="color:var(--red)">−${fmtMoney(x.perda)}</div>
+            </a>`).join('')}` : ''}
+
+        ${metodo === 'capital' && d.recebido > 0 && d.lucro === 0
+          ? '<p class="hint">Neste método, o lucro só aparece depois que o valor emprestado já voltou por completo.</p>' : ''}
+      </div>`;
   }
 
   // ---------------------------------------------------------------------------
@@ -640,6 +945,8 @@
         : `Marcar o empréstimo de ${loan.nome} como calote? O valor não recuperado entra como perda.`;
       if (!confirm(msg)) return;
       loan.calote = !loan.calote;
+      if (loan.calote) loan.caloteEm = todayISO();
+      else delete loan.caloteEm;
       save();
       toast(loan.calote ? 'Marcado como calote.' : 'Calote desmarcado.');
       renderDetalhe(loan.id);
@@ -938,6 +1245,7 @@
         <div class="row-btns">
           <button class="btn" id="c-csv">📄 Exportar empréstimos (CSV)</button>
           <button class="btn" id="c-csv-pag">📄 Exportar pagamentos (CSV)</button>
+          <button class="btn" id="c-csv-mes">📄 Exportar lucro mensal (CSV)</button>
         </div>
       </div>
 
@@ -963,6 +1271,7 @@
     $('#c-import').addEventListener('click', () => $('#import-file').click());
     $('#c-csv').addEventListener('click', exportCSV);
     $('#c-csv-pag').addEventListener('click', exportPagamentosCSV);
+    $('#c-csv-mes').addEventListener('click', exportMensalCSV);
     $('#c-senha-form').addEventListener('submit', onChangePass);
     $('#c-apagar').addEventListener('click', () => {
       if (!confirm('Apagar TODOS os empréstimos e pagamentos deste aparelho?')) return;
@@ -1031,6 +1340,7 @@
       })) : []
     };
     if (l.atualizadoEm) loan.atualizadoEm = l.atualizadoEm;
+    if (loan.calote && isValidISO(l.caloteEm)) loan.caloteEm = l.caloteEm;
     if (!loan.nome || !isValidISO(loan.data) || !(loan.valorEmprestado >= 0) || !(loan.valorTotal >= 0)) return null;
     if (loan.parcelas.some((p) => !isValidISO(p.vencimento) || !(p.valor >= 0))) return null;
     if (loan.pagamentos.some((p) => !isValidISO(p.data) || !(p.valor >= 0))) return null;
@@ -1123,6 +1433,22 @@
     );
     if (rows.length === 1) return toast('Não há pagamentos para exportar.');
     download(`pagamentos_${stamp()}.csv`, toCSV(rows), 'text/csv;charset=utf-8');
+    toast('CSV exportado.');
+  }
+
+  function exportMensalCSV() {
+    const metodo = getMetodo();
+    const meses = lucroPorMes(metodo);
+    const keys = Object.keys(meses).sort();
+    if (!keys.length) return toast('Não há dados para exportar.');
+    const rows = [['Mês', 'Emprestado no mês', 'Recebido', 'Lucro', 'Perdas (calotes)', 'Lucro líquido', 'Método']];
+    const nomeMetodo = metodo === 'capital' ? 'Capital volta primeiro' : 'Juros em cada pagamento';
+    keys.forEach((k) => {
+      const m = meses[k];
+      rows.push([`${k.slice(5)}/${k.slice(0, 4)}`, csvNum(m.emprestado), csvNum(m.recebido),
+        csvNum(m.lucro), csvNum(m.perdas), csvNum(m.liquido), nomeMetodo]);
+    });
+    download(`lucro-mensal_${stamp()}.csv`, toCSV(rows), 'text/csv;charset=utf-8');
     toast('CSV exportado.');
   }
 
