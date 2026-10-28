@@ -34,11 +34,11 @@
     <main id="view"></main>
 
     <nav class="bottomnav">
-      <a href="#/" data-nav="painel"><span>📊</span>Painel</a>
-      <a href="#/lista" data-nav="lista"><span>📋</span>Empréstimos</a>
-      <a href="#/novo" data-nav="novo" class="nav-add"><span>＋</span>Novo</a>
-      <a href="#/mensal" data-nav="mensal"><span>📅</span>Mensal</a>
-      <a href="#/config" data-nav="config"><span>⚙️</span>Dados</a>
+      <a href="#painel" data-nav="painel"><span>📊</span>Painel</a>
+      <a href="#lista" data-nav="lista"><span>📋</span>Empréstimos</a>
+      <a href="#novo" data-nav="novo" class="nav-add"><span>＋</span>Novo</a>
+      <a href="#mensal" data-nav="mensal"><span>📅</span>Mensal</a>
+      <a href="#config" data-nav="config"><span>⚙️</span>Dados</a>
     </nav>
   </div>
 
@@ -61,6 +61,12 @@
         <button type="submit" class="btn btn-primary" value="ok">Salvar</button>
       </div>
     </form>
+  </dialog>
+
+  <!-- Janela de confirmação -->
+  <dialog id="ask-dialog">
+    <p id="ask-msg"></p>
+    <div class="row-btns" id="ask-btns"></div>
   </dialog>
 
   <input type="file" id="import-file" accept="application/json,.json" hidden>

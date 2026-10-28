@@ -1,5 +1,7 @@
 /* Meus Empréstimos — controle de empréstimos pessoais
  * HTML/CSS/JS puro, dados salvos no localStorage do navegador.
+ * Quando aberto como Artifact no Claude, também sincroniza com o armazenamento
+ * privado da conta (capacidade `db`) e usa a capacidade `downloads` para exportar.
  */
 (function () {
   'use strict';
@@ -113,7 +115,82 @@
     toastTimer = setTimeout(() => (el.hidden = true), 2500);
   }
 
-  function download(filename, content, mime) {
+  // localStorage/sessionStorage podem falhar (navegação privada, bloqueio de dados).
+  const store = {
+    get(k, area) { try { return (area || localStorage).getItem(k); } catch (_) { return null; } },
+    set(k, v, area) { try { (area || localStorage).setItem(k, v); return true; } catch (_) { return false; } },
+    del(k, area) { try { (area || localStorage).removeItem(k); } catch (_) { /* ignora */ } }
+  };
+  const session = {
+    get: (k) => { try { return store.get(k, sessionStorage); } catch (_) { return null; } },
+    set: (k, v) => { try { store.set(k, v, sessionStorage); } catch (_) { /* ignora */ } },
+    del: (k) => { try { store.del(k, sessionStorage); } catch (_) { /* ignora */ } }
+  };
+
+  /**
+   * Janela de escolha dentro da página (substitui confirm/alert, que não
+   * funcionam em todos os lugares). Resolve com o `value` do botão tocado
+   * ou null se a janela for fechada.
+   */
+  function choose(message, buttons) {
+    return new Promise((resolve) => {
+      const dlg = $('#ask-dialog');
+      $('#ask-msg').textContent = message;
+      const box = $('#ask-btns');
+      box.innerHTML = '';
+      let done = false;
+      const finish = (v) => {
+        if (done) return;
+        done = true;
+        if (dlg.open) dlg.close();
+        resolve(v);
+      };
+      buttons.forEach((b) => {
+        const el = document.createElement('button');
+        el.type = 'button';
+        el.className = 'btn ' + (b.cls || '');
+        el.textContent = b.label;
+        el.addEventListener('click', () => finish(b.value));
+        box.appendChild(el);
+      });
+      dlg.addEventListener('close', () => finish(null), { once: true });
+      dlg.showModal();
+    });
+  }
+
+  const ask = (message, okLabel = 'Confirmar', danger = false) =>
+    choose(message, [
+      { label: 'Cancelar', value: false },
+      { label: okLabel, value: true, cls: danger ? 'btn-danger-solid' : 'btn-primary' }
+    ]).then((v) => v === true);
+
+  const notify = (message) => choose(message, [{ label: 'OK', value: true, cls: 'btn-primary' }]);
+
+  // Capacidades do Claude (só existem quando o app roda como Artifact).
+  const hasClaude = () => !!(window.claude && typeof window.claude.use === 'function');
+  let downloadsNs;
+  function getDownloads() {
+    if (downloadsNs === undefined) {
+      downloadsNs = hasClaude() ? Promise.resolve(window.claude.use('downloads')).catch(() => null) : Promise.resolve(null);
+    }
+    return downloadsNs;
+  }
+
+  /** Salva um arquivo; retorna true se foi salvo. */
+  async function download(filename, content, mime) {
+    const ns = await getDownloads();
+    if (ns) {
+      try {
+        await ns.save({ filename, data: content });
+        return true;
+      } catch (e) {
+        if (e && e.code === 'declined') return false;
+        if (e && e.code === 'rate_limited') { toast('Aguarde um instante e tente de novo.'); return false; }
+        console.error(e);
+        toast('Não foi possível salvar o arquivo aqui.');
+        return false;
+      }
+    }
     const blob = new Blob([content], { type: mime });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
@@ -123,6 +200,7 @@
     a.click();
     a.remove();
     setTimeout(() => URL.revokeObjectURL(url), 1000);
+    return true;
   }
 
   // ---------------------------------------------------------------------------
@@ -133,23 +211,90 @@
 
   function load() {
     try {
-      const raw = localStorage.getItem(STORAGE_KEY);
+      const raw = store.get(STORAGE_KEY);
       if (raw) {
         const parsed = JSON.parse(raw);
         if (parsed && Array.isArray(parsed.emprestimos)) db = parsed;
       }
     } catch (e) {
       console.error(e);
-      alert('Não foi possível ler os dados salvos.');
+      toast('Não foi possível ler os dados salvos.');
     }
   }
 
+  function saveLocal() {
+    return store.set(STORAGE_KEY, JSON.stringify(db));
+  }
+
   function save() {
+    db.atualizadoEm = new Date().toISOString();
+    const okLocal = saveLocal();
+    if (cloud.ref) pushCloud();
+    else if (!okLocal) toast('Erro ao salvar: o armazenamento do navegador está cheio ou bloqueado.');
+  }
+
+  // --- Sincronização com a conta do Claude (somente dentro do Claude) ---
+
+  const cloud = { ref: null, loading: false, writing: false, dirty: false };
+
+  function cloudBody() {
+    return {
+      versao: 1,
+      atualizadoEm: db.atualizadoEm || new Date().toISOString(),
+      emprestimos: db.emprestimos,
+      senha: store.get(PASS_KEY) || ''
+    };
+  }
+
+  /** Grava o estado na nuvem, uma gravação por vez (junta alterações seguidas). */
+  async function pushCloud() {
+    if (!cloud.ref) return;
+    if (cloud.writing) { cloud.dirty = true; return; }
+    cloud.writing = true;
     try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(db));
+      do {
+        cloud.dirty = false;
+        try {
+          await cloud.ref.set(JSON.parse(JSON.stringify(cloudBody())));
+        } catch (e) {
+          console.error(e);
+          if (e && e.code === 'quota_exceeded') toast('Limite de armazenamento atingido. Exporte um backup.');
+          else if (e && e.code === 'unavailable') { await new Promise((r) => setTimeout(r, 800 + Math.random() * 800)); cloud.dirty = true; }
+          else { toast('Não foi possível salvar na sua conta. Os dados ficaram salvos só neste aparelho.'); break; }
+        }
+      } while (cloud.dirty);
+    } finally {
+      cloud.writing = false;
+    }
+  }
+
+  async function initCloud() {
+    if (!hasClaude()) return;
+    cloud.loading = true;
+    if (!$('#lock').hidden) setupLock();
+    try {
+      const [dbNs, user] = await Promise.all([window.claude.use('db'), window.claude.use('user')]);
+      const id = dbNs && user ? await user.id() : null;
+      if (!id) return;
+      const ref = dbNs.doc('data/users/' + id + '/estado');
+      const snap = await ref.get();
+      cloud.ref = ref;
+      const remoto = snap.exists ? snap.data() : null;
+      const remotoMaisNovo = remoto && Array.isArray(remoto.emprestimos) &&
+        (!db.atualizadoEm || (remoto.atualizadoEm || '') >= db.atualizadoEm);
+      if (remoto && remoto.senha) store.set(PASS_KEY, remoto.senha);
+      if (remotoMaisNovo) {
+        db = { versao: 1, atualizadoEm: remoto.atualizadoEm, emprestimos: JSON.parse(JSON.stringify(remoto.emprestimos)) };
+        saveLocal();
+        route();
+      } else if (db.emprestimos.length || store.get(PASS_KEY)) {
+        pushCloud();
+      }
     } catch (e) {
       console.error(e);
-      alert('Erro ao salvar os dados. O armazenamento do navegador pode estar cheio.');
+    } finally {
+      cloud.loading = false;
+      if (!$('#lock').hidden) setupLock();
     }
   }
 
@@ -258,12 +403,19 @@
   }
 
   function setupLock() {
-    const hasPass = !!localStorage.getItem(PASS_KEY);
+    const hasPass = !!store.get(PASS_KEY);
     const pass2 = $('#lock-pass2');
     $('#lock-error').hidden = true;
     $('#lock-pass').value = '';
     pass2.value = '';
-    if (hasPass) {
+    $('#lock-btn').disabled = false;
+    if (!hasPass && cloud.loading) {
+      $('#lock-msg').textContent = 'Carregando seus dados…';
+      pass2.hidden = true;
+      pass2.required = false;
+      $('#lock-btn').textContent = 'Aguarde…';
+      $('#lock-btn').disabled = true;
+    } else if (hasPass) {
       $('#lock-msg').textContent = 'Digite sua senha para entrar.';
       pass2.hidden = true;
       pass2.required = false;
@@ -283,19 +435,21 @@
     e.preventDefault();
     const err = $('#lock-error');
     const p1 = $('#lock-pass').value;
-    const stored = localStorage.getItem(PASS_KEY);
+    const stored = store.get(PASS_KEY);
     err.hidden = true;
+    if (!stored && cloud.loading) return;
 
     if (!stored) {
       const p2 = $('#lock-pass2').value;
       if (p1.length < 4) return showErr(err, 'A senha precisa ter pelo menos 4 caracteres.');
       if (p1 !== p2) return showErr(err, 'As senhas não conferem.');
-      localStorage.setItem(PASS_KEY, await hashPass(p1));
+      store.set(PASS_KEY, await hashPass(p1));
+      if (cloud.ref) pushCloud();
     } else if ((await hashPass(p1)) !== stored) {
       $('#lock-pass').value = '';
       return showErr(err, 'Senha incorreta.');
     }
-    sessionStorage.setItem(SESSION_KEY, '1');
+    session.set(SESSION_KEY, '1');
     unlock();
   }
 
@@ -311,7 +465,7 @@
   }
 
   function lock() {
-    sessionStorage.removeItem(SESSION_KEY);
+    session.del(SESSION_KEY);
     setupLock();
   }
 
@@ -335,19 +489,23 @@
 
   function route() {
     if ($('#app').hidden) return;
-    const hash = location.hash.replace(/^#/, '') || '/';
-    const parts = hash.split('/').filter(Boolean);
+    // Rotas no formato #nome ou #nome-id (aceita também o formato antigo #/nome/id).
+    const hash = location.hash.replace(/^#\/?/, '').replace('/', '-');
+    const i = hash.indexOf('-');
+    const nome = i < 0 ? hash : hash.slice(0, i);
+    const arg = i < 0 ? '' : hash.slice(i + 1);
     window.scrollTo(0, 0);
 
-    if (parts.length === 0) return renderPainel();
-    switch (parts[0]) {
+    switch (nome) {
+      case '':
+      case 'painel': return renderPainel();
       case 'lista': return renderLista();
       case 'novo': return renderForm(null);
-      case 'editar': return renderForm(parts[1]);
-      case 'emprestimo': return renderDetalhe(parts[1]);
+      case 'editar': return renderForm(arg);
+      case 'emprestimo': return renderDetalhe(arg);
       case 'config': return renderConfig();
-      case 'mensal': return renderMensal(parts[1]);
-      default: location.hash = '#/';
+      case 'mensal': return renderMensal();
+      default: location.hash = '#painel';
     }
   }
 
@@ -415,7 +573,7 @@
         <h2>Empréstimos por status</h2>
         <div class="counts">
           ${Object.keys(STATUS_LABEL).map((k) => `
-            <a class="badge ${k}" href="#/lista" data-status="${k}">${STATUS_LABEL[k]}: ${t.qtd[k]}</a>
+            <a class="badge ${k}" href="#lista" data-status="${k}">${STATUS_LABEL[k]}: ${t.qtd[k]}</a>
           `).join('')}
         </div>
       </div>
@@ -423,7 +581,7 @@
       <div class="card">
         <h2>Próximos vencimentos</h2>
         ${proximos.length ? proximos.map(({ l, c }) => `
-          <a class="list-row" href="#/emprestimo/${l.id}" style="color:inherit;text-decoration:none">
+          <a class="list-row" href="#emprestimo-${l.id}" style="color:inherit;text-decoration:none">
             <div class="grow">
               <div><strong>${esc(l.nome)}</strong></div>
               <div class="sub">Parcela ${c.proxima.numero}/${c.parcelas.length} · vence ${fmtDate(c.proxima.vencimento)}</div>
@@ -436,7 +594,7 @@
       ${db.emprestimos.length === 0 ? `
         <div class="empty">
           <p>Você ainda não cadastrou nenhum empréstimo.</p>
-          <a class="btn btn-primary" href="#/novo">＋ Cadastrar empréstimo</a>
+          <a class="btn btn-primary" href="#novo">＋ Cadastrar empréstimo</a>
         </div>` : ''}
     `;
 
@@ -452,8 +610,7 @@
   // ---------------------------------------------------------------------------
 
   function getMetodo() {
-    try { return localStorage.getItem(METODO_KEY) === 'capital' ? 'capital' : 'proporcional'; }
-    catch (_) { return 'proporcional'; }
+    return store.get(METODO_KEY) === 'capital' ? 'capital' : 'proporcional';
   }
 
   const mesKey = (iso) => iso.slice(0, 7);
@@ -529,7 +686,7 @@
     const b = meses[anterior] || { liquido: 0 };
     const diff = round2(a.liquido - b.liquido);
     return `
-      <a class="card month-card" href="#/mensal">
+      <a class="card month-card" href="#mensal">
         <div>
           <div class="stat-label">Lucro de ${MESES_LONGO[Number(atual.slice(5)) - 1].toLowerCase()}</div>
           <div class="stat-value" style="color:${a.liquido < 0 ? 'var(--red)' : 'var(--green)'}">${fmtMoney(a.liquido)}</div>
@@ -648,7 +805,7 @@
       renderMensal();
     });
     $('#m-metodo').addEventListener('change', (e) => {
-      try { localStorage.setItem(METODO_KEY, e.target.value); } catch (_) { /* preferência opcional */ }
+      store.set(METODO_KEY, e.target.value);
       renderMensal();
     });
     $$('[data-mes]', view()).forEach((el) =>
@@ -719,7 +876,7 @@
 
         <h3 class="section-title" style="margin-left:0">Pagamentos recebidos (${pags.length})</h3>
         ${pags.length ? pags.map((x) => `
-          <a class="list-row" href="#/emprestimo/${x.loan.id}" style="color:inherit;text-decoration:none">
+          <a class="list-row" href="#emprestimo-${x.loan.id}" style="color:inherit;text-decoration:none">
             <div class="grow">
               <div><strong>${esc(x.loan.nome)}</strong></div>
               <div class="sub">${fmtDate(x.pag.data)}${x.pag.obs ? ' · ' + esc(x.pag.obs) : ''}</div>
@@ -732,7 +889,7 @@
         ${d.calotes.length ? `
           <h3 class="section-title" style="margin-left:0">Calotes (${d.calotes.length})</h3>
           ${d.calotes.map((x) => `
-            <a class="list-row" href="#/emprestimo/${x.loan.id}" style="color:inherit;text-decoration:none">
+            <a class="list-row" href="#emprestimo-${x.loan.id}" style="color:inherit;text-decoration:none">
               <div class="grow"><strong>${esc(x.loan.nome)}</strong></div>
               <div class="amount" style="color:var(--red)">−${fmtMoney(x.perda)}</div>
             </a>`).join('')}` : ''}
@@ -807,7 +964,7 @@
     if (!itens.length) {
       box.innerHTML = db.emprestimos.length
         ? '<div class="empty">Nenhum empréstimo encontrado com esses filtros.</div>'
-        : '<div class="empty"><p>Nenhum empréstimo cadastrado.</p><a class="btn btn-primary" href="#/novo">＋ Cadastrar empréstimo</a></div>';
+        : '<div class="empty"><p>Nenhum empréstimo cadastrado.</p><a class="btn btn-primary" href="#novo">＋ Cadastrar empréstimo</a></div>';
       return;
     }
 
@@ -819,7 +976,7 @@
       else if (c.proxima) info = `Próx.: ${fmtDate(c.proxima.vencimento)} · ${fmtMoney(c.proxima.falta)}`;
       else info = '';
       return `
-        <a class="loan-item" href="#/emprestimo/${l.id}">
+        <a class="loan-item" href="#emprestimo-${l.id}">
           <div class="loan-top">
             <span class="loan-name">${esc(l.nome)}</span>
             <span class="badge ${c.status}">${STATUS_LABEL[c.status]}</span>
@@ -844,7 +1001,7 @@
     const loan = getLoan(id);
     if (!loan) {
       toast('Empréstimo não encontrado.');
-      location.hash = '#/lista';
+      location.hash = '#lista';
       return;
     }
     setHeader(loan.nome, true);
@@ -874,7 +1031,7 @@
         ${loan.obs ? `<div class="obs">${esc(loan.obs)}</div>` : ''}
         <div class="row-btns">
           ${c.status !== 'calote' ? '<button class="btn btn-primary" id="d-pagar">＋ Registrar pagamento</button>' : ''}
-          <a class="btn" href="#/editar/${loan.id}">✏️ Editar</a>
+          <a class="btn" href="#editar-${loan.id}">✏️ Editar</a>
         </div>
       </div>
 
@@ -928,10 +1085,10 @@
       })
     );
     $$('[data-del-pay]').forEach((b) =>
-      b.addEventListener('click', () => {
+      b.addEventListener('click', async () => {
         const pay = loan.pagamentos.find((p) => p.id === b.dataset.delPay);
         if (!pay) return;
-        if (!confirm(`Excluir o pagamento de ${fmtMoney(pay.valor)} em ${fmtDate(pay.data)}?`)) return;
+        if (!(await ask(`Excluir o pagamento de ${fmtMoney(pay.valor)} em ${fmtDate(pay.data)}?`, 'Excluir', true))) return;
         loan.pagamentos = loan.pagamentos.filter((p) => p.id !== pay.id);
         save();
         toast('Pagamento excluído.');
@@ -939,11 +1096,11 @@
       })
     );
 
-    $('#d-calote').addEventListener('click', () => {
+    $('#d-calote').addEventListener('click', async () => {
       const msg = loan.calote
         ? 'Desmarcar calote? O status voltará a ser calculado automaticamente.'
         : `Marcar o empréstimo de ${loan.nome} como calote? O valor não recuperado entra como perda.`;
-      if (!confirm(msg)) return;
+      if (!(await ask(msg, loan.calote ? 'Desmarcar' : 'Marcar calote', !loan.calote))) return;
       loan.calote = !loan.calote;
       if (loan.calote) loan.caloteEm = todayISO();
       else delete loan.caloteEm;
@@ -952,12 +1109,12 @@
       renderDetalhe(loan.id);
     });
 
-    $('#d-excluir').addEventListener('click', () => {
-      if (!confirm(`Excluir o empréstimo de ${loan.nome} e todos os seus pagamentos? Esta ação não pode ser desfeita.`)) return;
+    $('#d-excluir').addEventListener('click', async () => {
+      if (!(await ask(`Excluir o empréstimo de ${loan.nome} e todos os seus pagamentos? Esta ação não pode ser desfeita.`, 'Excluir', true))) return;
       db.emprestimos = db.emprestimos.filter((l) => l.id !== loan.id);
       save();
       toast('Empréstimo excluído.');
-      location.hash = '#/lista';
+      location.hash = '#lista';
     });
   }
 
@@ -988,7 +1145,7 @@
     payCtx = null;
   }
 
-  function onPaySubmit(e) {
+  async function onPaySubmit(e) {
     e.preventDefault();
     if (!payCtx) return closePayDialog();
     const loan = getLoan(payCtx.loanId);
@@ -1004,7 +1161,8 @@
     // Avisa se o pagamento ultrapassa o total a receber.
     const outros = loan.pagamentos.filter((p) => p.id !== payCtx.payId).reduce((s, p) => s + p.valor, 0);
     if (outros + valor > loan.valorTotal + EPS) {
-      if (!confirm(`Com este pagamento o total recebido (${fmtMoney(outros + valor)}) passa do total a receber (${fmtMoney(loan.valorTotal)}). Salvar mesmo assim?`)) return;
+      if (!(await ask(`Com este pagamento o total recebido (${fmtMoney(outros + valor)}) passa do total a receber (${fmtMoney(loan.valorTotal)}). Salvar mesmo assim?`, 'Salvar'))) return;
+      if (!payCtx) return;
     }
 
     if (payCtx.payId) {
@@ -1028,7 +1186,7 @@
     const loan = id ? getLoan(id) : null;
     if (id && !loan) {
       toast('Empréstimo não encontrado.');
-      location.hash = '#/lista';
+      location.hash = '#lista';
       return;
     }
     setHeader(loan ? 'Editar empréstimo' : 'Novo empréstimo', !!loan);
@@ -1101,7 +1259,7 @@
     $('#l-venc').addEventListener('change', () => gerarParcelas());
     $('#l-gerar').addEventListener('click', () => gerarParcelas());
     $('#l-cancelar').addEventListener('click', () => {
-      location.hash = loan ? `#/emprestimo/${loan.id}` : '#/';
+      location.hash = loan ? `#emprestimo-${loan.id}` : '#painel';
     });
     $('#loan-form').addEventListener('submit', onLoanSubmit);
   }
@@ -1171,7 +1329,7 @@
       (total > 0 && !ok ? ` — diferente do total a receber (${fmtMoney(total)})` : '');
   }
 
-  function onLoanSubmit(e) {
+  async function onLoanSubmit(e) {
     e.preventDefault();
     const err = $('#l-error');
     err.hidden = true;
@@ -1195,7 +1353,8 @@
       return showErr(err, `A soma das parcelas (${fmtMoney(soma)}) precisa ser igual ao total a receber (${fmtMoney(valorTotal)}). Use "Recalcular parcelas" ou ajuste os valores.`);
     }
     if (valorTotal < valorEmprestado &&
-        !confirm('O total a receber é menor que o valor emprestado (prejuízo). Salvar mesmo assim?')) return;
+        !(await ask('O total a receber é menor que o valor emprestado (prejuízo). Salvar mesmo assim?', 'Salvar'))) return;
+    if (!formState) return;
 
     parcelas.sort((a, b) => a.vencimento.localeCompare(b.vencimento));
 
@@ -1214,7 +1373,7 @@
     }
     save();
     formState = null;
-    location.hash = `#/emprestimo/${loan.id}`;
+    location.hash = `#emprestimo-${loan.id}`;
   }
 
   // ---------------------------------------------------------------------------
@@ -1273,9 +1432,9 @@
     $('#c-csv-pag').addEventListener('click', exportPagamentosCSV);
     $('#c-csv-mes').addEventListener('click', exportMensalCSV);
     $('#c-senha-form').addEventListener('submit', onChangePass);
-    $('#c-apagar').addEventListener('click', () => {
-      if (!confirm('Apagar TODOS os empréstimos e pagamentos deste aparelho?')) return;
-      if (!confirm('Tem certeza? Recomendamos exportar um backup antes. Esta ação não pode ser desfeita.')) return;
+    $('#c-apagar').addEventListener('click', async () => {
+      if (!(await ask('Apagar TODOS os empréstimos e pagamentos?', 'Apagar', true))) return;
+      if (!(await ask('Tem certeza? Recomendamos exportar um backup antes. Esta ação não pode ser desfeita.', 'Apagar tudo', true))) return;
       db = { versao: 1, emprestimos: [] };
       save();
       toast('Dados apagados.');
@@ -1290,10 +1449,11 @@
     const atual = $('#c-atual').value;
     const nova = $('#c-nova').value;
     const nova2 = $('#c-nova2').value;
-    if ((await hashPass(atual)) !== localStorage.getItem(PASS_KEY)) return showErr(err, 'Senha atual incorreta.');
+    if ((await hashPass(atual)) !== store.get(PASS_KEY)) return showErr(err, 'Senha atual incorreta.');
     if (nova.length < 4) return showErr(err, 'A nova senha precisa ter pelo menos 4 caracteres.');
     if (nova !== nova2) return showErr(err, 'As novas senhas não conferem.');
-    localStorage.setItem(PASS_KEY, await hashPass(nova));
+    store.set(PASS_KEY, await hashPass(nova));
+    if (cloud.ref) pushCloud();
     e.target.reset();
     toast('Senha alterada.');
   }
@@ -1303,15 +1463,16 @@
     return toISO(d) + '_' + String(d.getHours()).padStart(2, '0') + String(d.getMinutes()).padStart(2, '0');
   }
 
-  function exportJSON() {
+  async function exportJSON() {
     const payload = {
       app: 'meus-emprestimos',
       versao: 1,
       exportadoEm: new Date().toISOString(),
       emprestimos: db.emprestimos
     };
-    download(`emprestimos-backup_${stamp()}.json`, JSON.stringify(payload, null, 2), 'application/json');
-    toast('Backup exportado.');
+    if (await download(`emprestimos-backup_${stamp()}.json`, JSON.stringify(payload, null, 2), 'application/json')) {
+      toast('Backup exportado.');
+    }
   }
 
   /** Valida e normaliza um empréstimo vindo de um backup. Retorna null se inválido. */
@@ -1353,26 +1514,32 @@
     e.target.value = '';
     if (!file) return;
     const reader = new FileReader();
-    reader.onload = () => {
+    reader.onload = async () => {
       let parsed;
       try {
         parsed = JSON.parse(reader.result);
       } catch (_) {
-        return alert('Arquivo inválido: não é um JSON.');
+        return notify('Arquivo inválido: não é um backup em JSON.');
       }
       const lista = Array.isArray(parsed) ? parsed : parsed && parsed.emprestimos;
-      if (!Array.isArray(lista)) return alert('Arquivo inválido: não contém empréstimos.');
+      if (!Array.isArray(lista)) return notify('Arquivo inválido: não contém empréstimos.');
 
       const validos = lista.map(normalizeLoan).filter(Boolean);
       const invalidos = lista.length - validos.length;
-      if (!validos.length) return alert('Nenhum empréstimo válido encontrado no arquivo.');
+      if (!validos.length) return notify('Nenhum empréstimo válido encontrado no arquivo.');
 
       const msg = `O backup contém ${validos.length} empréstimo(s)` +
         (invalidos ? ` (${invalidos} inválido(s) serão ignorados)` : '') +
-        `.\n\nOK = SUBSTITUIR todos os dados atuais pelo backup.\nCancelar = escolher outra opção.`;
-      if (confirm(msg)) {
+        '.\n\nSubstituir: apaga os dados atuais e usa só o backup.\n' +
+        'Juntar: mantém os dados atuais e acrescenta o backup (empréstimos repetidos são atualizados).';
+      const opcao = await choose(msg, [
+        { label: 'Cancelar', value: null },
+        { label: 'Juntar', value: 'juntar' },
+        { label: 'Substituir', value: 'substituir', cls: 'btn-primary' }
+      ]);
+      if (opcao === 'substituir') {
         db = { versao: 1, emprestimos: validos };
-      } else if (confirm('Deseja JUNTAR o backup com os dados atuais?\n(Empréstimos com o mesmo ID serão atualizados pelo backup.)')) {
+      } else if (opcao === 'juntar') {
         const byId = new Map(db.emprestimos.map((l) => [l.id, l]));
         validos.forEach((l) => byId.set(l.id, l));
         db = { versao: 1, emprestimos: Array.from(byId.values()) };
@@ -1383,7 +1550,7 @@
       toast('Backup importado.');
       route();
     };
-    reader.onerror = () => alert('Não foi possível ler o arquivo.');
+    reader.onerror = () => notify('Não foi possível ler o arquivo.');
     reader.readAsText(file);
   }
 
@@ -1399,7 +1566,7 @@
     return '﻿' + rows.map((r) => r.map(csvCell).join(';')).join('\r\n');
   }
 
-  function exportCSV() {
+  async function exportCSV() {
     if (!db.emprestimos.length) return toast('Não há empréstimos para exportar.');
     const rows = [[
       'Nome', 'Data', 'Valor emprestado', 'Total a receber', 'Lucro previsto', 'Recebido',
@@ -1419,11 +1586,10 @@
           l.obs || ''
         ]);
       });
-    download(`emprestimos_${stamp()}.csv`, toCSV(rows), 'text/csv;charset=utf-8');
-    toast('CSV exportado.');
+    if (await download(`emprestimos_${stamp()}.csv`, toCSV(rows), 'text/csv;charset=utf-8')) toast('CSV exportado.');
   }
 
-  function exportPagamentosCSV() {
+  async function exportPagamentosCSV() {
     const rows = [['Nome', 'Data do empréstimo', 'Data do pagamento', 'Valor', 'Observação']];
     db.emprestimos.forEach((l) =>
       l.pagamentos
@@ -1432,11 +1598,10 @@
         .forEach((p) => rows.push([l.nome, fmtDate(l.data), fmtDate(p.data), csvNum(p.valor), p.obs || '']))
     );
     if (rows.length === 1) return toast('Não há pagamentos para exportar.');
-    download(`pagamentos_${stamp()}.csv`, toCSV(rows), 'text/csv;charset=utf-8');
-    toast('CSV exportado.');
+    if (await download(`pagamentos_${stamp()}.csv`, toCSV(rows), 'text/csv;charset=utf-8')) toast('CSV exportado.');
   }
 
-  function exportMensalCSV() {
+  async function exportMensalCSV() {
     const metodo = getMetodo();
     const meses = lucroPorMes(metodo);
     const keys = Object.keys(meses).sort();
@@ -1448,8 +1613,7 @@
       rows.push([`${k.slice(5)}/${k.slice(0, 4)}`, csvNum(m.emprestado), csvNum(m.recebido),
         csvNum(m.lucro), csvNum(m.perdas), csvNum(m.liquido), nomeMetodo]);
     });
-    download(`lucro-mensal_${stamp()}.csv`, toCSV(rows), 'text/csv;charset=utf-8');
-    toast('CSV exportado.');
+    if (await download(`lucro-mensal_${stamp()}.csv`, toCSV(rows), 'text/csv;charset=utf-8')) toast('CSV exportado.');
   }
 
   // ---------------------------------------------------------------------------
@@ -1460,7 +1624,8 @@
     load();
     $('#lock-form').addEventListener('submit', onLockSubmit);
     $('#btn-lock').addEventListener('click', lock);
-    $('#btn-back').addEventListener('click', () => history.length > 1 ? history.back() : (location.hash = '#/lista'));
+    $('#btn-back').addEventListener('click', () => history.length > 1 ? history.back() : (location.hash = '#lista'));
+    $('#ask-dialog').addEventListener('cancel', (e) => { e.preventDefault(); $('#ask-dialog').close(); });
     $('#pay-form').addEventListener('submit', onPaySubmit);
     $('#pay-cancel').addEventListener('click', closePayDialog);
     $('#import-file').addEventListener('change', onImportFile);
@@ -1471,8 +1636,9 @@
       if (e.key === STORAGE_KEY) { load(); route(); }
     });
 
-    if (localStorage.getItem(PASS_KEY) && sessionStorage.getItem(SESSION_KEY) === '1') unlock();
+    if (store.get(PASS_KEY) && session.get(SESSION_KEY) === '1') unlock();
     else setupLock();
+    initCloud();
   }
 
   document.addEventListener('DOMContentLoaded', init);
