@@ -10,6 +10,7 @@
   const PASS_KEY = 'emprestimos.senha.v1';
   const SESSION_KEY = 'emprestimos.sessao';
   const METODO_KEY = 'emprestimos.metodoLucro';
+  const TEMA_KEY = 'emprestimos.tema';
 
   const MESES = ['Jan', 'Fev', 'Mar', 'Abr', 'Mai', 'Jun', 'Jul', 'Ago', 'Set', 'Out', 'Nov', 'Dez'];
   const MESES_LONGO = ['Janeiro', 'Fevereiro', 'Março', 'Abril', 'Maio', 'Junho',
@@ -481,6 +482,26 @@
     $('#title').textContent = title;
     $('#btn-back').hidden = !back;
     document.title = title + ' · Meus Empréstimos';
+  }
+
+  // Tema: 'auto' segue o celular; 'claro'/'escuro' forçam pelo atributo data-theme.
+  let temaForcado = false;
+  const getTema = () => {
+    const t = store.get(TEMA_KEY);
+    return t === 'claro' || t === 'escuro' ? t : 'auto';
+  };
+
+  function aplicarTema() {
+    const t = getTema();
+    const root = document.documentElement;
+    if (t === 'auto') {
+      // Só remove o atributo se fomos nós que o colocamos.
+      if (temaForcado) root.removeAttribute('data-theme');
+      temaForcado = false;
+    } else {
+      root.setAttribute('data-theme', t === 'escuro' ? 'dark' : 'light');
+      temaForcado = true;
+    }
   }
 
   function setNav(name) {
@@ -1385,7 +1406,18 @@
     setNav('config');
     const nPag = db.emprestimos.reduce((s, l) => s + l.pagamentos.length, 0);
 
+    const tema = getTema();
     view().innerHTML = `
+      <div class="card">
+        <h2>Aparência</h2>
+        <div class="segmented" role="radiogroup" aria-label="Tema">
+          ${[['auto', 'Automático'], ['claro', '☀️ Claro'], ['escuro', '🌙 Escuro']].map(([v, l]) => `
+            <button type="button" role="radio" aria-checked="${v === tema}" class="${v === tema ? 'on' : ''}" data-tema="${v}">${l}</button>
+          `).join('')}
+        </div>
+        <p class="hint">Automático segue o modo claro/escuro do celular.</p>
+      </div>
+
       <div class="card">
         <h2>Backup</h2>
         <p class="muted" style="margin-top:0">
@@ -1426,6 +1458,13 @@
       </div>
     `;
 
+    $$('[data-tema]', view()).forEach((b) =>
+      b.addEventListener('click', () => {
+        store.set(TEMA_KEY, b.dataset.tema);
+        aplicarTema();
+        renderConfig();
+      })
+    );
     $('#c-export').addEventListener('click', exportJSON);
     $('#c-import').addEventListener('click', () => $('#import-file').click());
     $('#c-csv').addEventListener('click', exportCSV);
@@ -1621,6 +1660,7 @@
   // ---------------------------------------------------------------------------
 
   function init() {
+    aplicarTema();
     load();
     $('#lock-form').addEventListener('submit', onLockSubmit);
     $('#btn-lock').addEventListener('click', lock);
